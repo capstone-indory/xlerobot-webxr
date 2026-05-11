@@ -1,0 +1,622 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>XLerobot WebXR — M0b hello-world</title>
+<!--
+  M0b deliverable per xlerobot_vr_teleop_plan.md §8 row "0b":
+    "최소 HTML/JS 페이지 (Mac에서 HTTPS 호스팅, 데모 mp4 한 개, Gamepad API 로깅)"
+  검증 조건:
+    (i)   immersive-vr 세션 진입
+    (ii)  <video> 텍스처 동시 렌더링 (멈춤/검은 화면 없음)
+    (iii) B/Y/A/X 버튼 이벤트가 page JS 까지 도달 (가로채기 없음)
+
+  이 파일은 단일 HTML, three.js + WebXR Device API, ~300줄.
+  M4 (§8 row "4") 진입을 위해 §4.1 의 WebSocket pose 페이로드도 같이 송출하지만
+  /ws 미연결이어도 페이지는 정상 동작한다.
+
+  버튼 매핑 (Quest Touch Plus, §4.1):
+    buttons[0]=trigger (집게)            → gripper close (analog)
+    buttons[1]=grip    (검지 그립)       → clutch hold (analog)
+    buttons[3]=thumbstick click          → M0b 단계 e-stop release fallback (§8 비고)
+    buttons[4]=A (R) / X (L)             → anchor 강제 리셋
+    buttons[5]=B (R) / Y (L)             → e-stop latched
+    menu (system) 버튼은 OS 가 가로채므로 page JS 에 안 옴. 그래서 계획서 §4.1
+    의 "menu long-press 1s 해제" 는 M0b 에서 동작하지 않을 가능성이 크고, §8 M0b
+    비고에 따라 thumbstick click 을 e-stop release fallback 으로 미리 둔다.
+    M0b 의 검증 항목 중 하나가 "B/Y/A/X 가 page JS 까지 도달" 인 이유가 이것이다.
+
+  좌표계: reference space 는 `local-floor` (§4.1). 즉 WebXR `+X right, +Y up, -Z forward`,
+  RH, m. robot base frame 변환은 §4.4 의 R_robot_from_xr 인데, 그 변환은 Mac proxy 가 아니라
+  VR bridge 의 책임이므로 (§4.3) 페이지는 raw `local-floor` 좌표만 송출한다.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #0a0e14; color: #e6e6e6;
+    font-family: ui-sans-serif, -apple-system, system-ui, sans-serif; }
+  #overlay { position: fixed; top: 16px; left: 16px; max-width: 520px;
+    background: rgba(15, 23, 42, 0.85); padding: 16px 20px; border-radius: 12px;
+    line-height: 1.5; font-size: 14px; }
+  #overlay h1 { margin: 0 0 8px 0; font-size: 17px; font-weight: 700; color: #67e8f9; }
+  #overlay code { background: #1e293b; padding: 1px 6px; border-radius: 4px; }
+  #enterVR { margin-top: 12px; padding: 10px 18px; font-size: 14px; font-weight: 600;
+    border: 0; border-radius: 8px; background: #06b6d4; color: #0a0e14; cursor: pointer; }
+  #enterVR[disabled] { background: #475569; color: #94a3b8; cursor: not-allowed; }
+  #status { margin-top: 10px; color: #fbbf24; }
+  #log { margin-top: 12px; font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 12px; max-height: 240px; overflow-y: auto; color: #94a3b8;
+    border-top: 1px solid #1e293b; padding-top: 8px; }
+  .ok { color: #34d399; }
+  .err { color: #f87171; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; margin-right: 4px; background: #1e293b; }
+  .pill.on { background: #06b6d4; color: #0a0e14; }
+  .pill.estop { background: #f43f5e; color: #fff; }
+</style>
+</head>
+<body>
+
+<div id="overlay">
+  <h1>XLerobot WebXR · M0b hello-world</h1>
+  <div>Quest Browser 에서 <code>https://&lt;mac-lan-ip&gt;:8443/</code> 로 접속 →
+    <em>Enter VR</em> 클릭.</div>
+  <div id="status">checking WebXR support…</div>
+  <button id="enterVR" disabled>Enter VR</button>
+  <div id="log"></div>
+</div>
+
+<!-- M0b 검증용 비디오. assets/demo.mp4 가 없으면 README 참조해서 한 개 넣어둘 것.
+     same-origin 이므로 crossorigin 속성 불필요 (지정 시 일부 브라우저가 CORS 헤더 부재로 거부). -->
+<video id="demoVideo" loop muted autoplay playsinline
+       style="display:none" src="./assets/demo.mp4"></video>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+
+// ───────────────────────────────────────────────────────────────────────────
+// DOM helpers
+// ───────────────────────────────────────────────────────────────────────────
+const $status = document.getElementById("status");
+const $enter  = document.getElementById("enterVR");
+const $log    = document.getElementById("log");
+const $video  = document.getElementById("demoVideo");
+
+const MAX_LOG_LINES = 80;
+const logLines = [];
+function logLine(msg, cls = "") {
+  const ts = new Date().toLocaleTimeString();
+  logLines.push(`<div class="${cls}">[${ts}] ${msg}</div>`);
+  if (logLines.length > MAX_LOG_LINES) logLines.shift();
+  $log.innerHTML = logLines.join("");
+  $log.scrollTop = $log.scrollHeight;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// WebXR support probe
+// ───────────────────────────────────────────────────────────────────────────
+(async () => {
+  if (!("xr" in navigator)) {
+    $status.innerHTML = `<span class="err">navigator.xr 없음 — Quest Browser 또는 WebXR 지원 브라우저에서 열어야 합니다.</span>`;
+    return;
+  }
+  try {
+    const ok = await navigator.xr.isSessionSupported("immersive-vr");
+    if (!ok) {
+      $status.innerHTML = `<span class="err">immersive-vr 미지원.</span>`;
+      return;
+    }
+  } catch (e) {
+    $status.innerHTML = `<span class="err">isSessionSupported 실패: ${e.message}</span>`;
+    return;
+  }
+  $status.innerHTML = `<span class="ok">WebXR immersive-vr 사용 가능.</span>`;
+  $enter.disabled = false;
+})();
+
+// ───────────────────────────────────────────────────────────────────────────
+// three.js scene
+// ───────────────────────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0e14);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 50);
+
+// floor grid (orientation aid in immersive)
+const grid = new THREE.GridHelper(10, 20, 0x334155, 0x1e293b);
+grid.position.y = 0;
+scene.add(grid);
+
+// floor disc (subtle)
+const floor = new THREE.Mesh(
+  new THREE.CircleGeometry(5, 48),
+  new THREE.MeshBasicMaterial({ color: 0x0f172a })
+);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = -0.002;
+scene.add(floor);
+
+// ambient + directional light (basic so HUD panels are readable)
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+dir.position.set(1, 2, 1);
+scene.add(dir);
+
+// ── video plane ────────────────────────────────────────────────────────────
+// 1.6m wide @ 1.6m in front, eye height 1.5m. mono.
+const videoTex = new THREE.VideoTexture($video);
+videoTex.colorSpace = THREE.SRGBColorSpace;
+videoTex.minFilter = THREE.LinearFilter;
+videoTex.magFilter = THREE.LinearFilter;
+const videoPlane = new THREE.Mesh(
+  new THREE.PlaneGeometry(1.6, 0.9),    // 16:9
+  new THREE.MeshBasicMaterial({ map: videoTex, side: THREE.DoubleSide })
+);
+videoPlane.position.set(0, 1.5, -1.6);
+scene.add(videoPlane);
+
+// fallback: if the demo.mp4 fails to load, draw a fallback "video missing" texture.
+// This way the page still renders something on the plane (M0b check (ii) needs
+// the plane to render — black-frame stall is the failure mode we screen for).
+$video.addEventListener("error", () => {
+  logLine("video load failed — using fallback texture", "err");
+  const fb = makeFallbackCanvasTexture("demo.mp4 missing — see README");
+  videoPlane.material.map = fb;
+  videoPlane.material.needsUpdate = true;
+});
+$video.addEventListener("playing", () => logLine("video playing", "ok"));
+
+function makeFallbackCanvasTexture(text) {
+  const c = document.createElement("canvas");
+  c.width = 1280; c.height = 720;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#1e293b"; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.fillStyle = "#f87171"; ctx.font = "bold 56px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(text, c.width / 2, c.height / 2);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+// ── HUD: a CanvasTexture panel in front of the user that shows live state ──
+const hudCanvas = document.createElement("canvas");
+hudCanvas.width = 1024; hudCanvas.height = 512;
+const hudCtx = hudCanvas.getContext("2d");
+const hudTex = new THREE.CanvasTexture(hudCanvas);
+hudTex.colorSpace = THREE.SRGBColorSpace;
+const hudPlane = new THREE.Mesh(
+  new THREE.PlaneGeometry(1.2, 0.6),
+  new THREE.MeshBasicMaterial({ map: hudTex, transparent: true })
+);
+hudPlane.position.set(0, 0.55, -1.2);
+hudPlane.rotation.x = -0.35;
+scene.add(hudPlane);
+
+// ───────────────────────────────────────────────────────────────────────────
+// Controller visualizations (small spheres at gripSpace pose)
+// ───────────────────────────────────────────────────────────────────────────
+const controllerMeshes = [0, 1].map(i => {
+  const m = new THREE.Mesh(
+    new THREE.SphereGeometry(0.035, 16, 12),
+    new THREE.MeshBasicMaterial({ color: i === 0 ? 0x06b6d4 : 0xa78bfa })
+  );
+  m.visible = false;
+  scene.add(m);
+  return m;
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// State (mirrors §4.1 WebSocket payload schema)
+// ───────────────────────────────────────────────────────────────────────────
+const state = {
+  hmd: null,                                  // [x,y,z,qx,qy,qz,qw]
+  left:  emptyHand(),
+  right: emptyHand(),
+  estop: false,                               // latched per §4.1
+  // local UX state
+  anchorResetPulse: { left: 0, right: 0 },    // wall-clock ms of last A/X press
+  prevButtons: { left: {}, right: {} },       // for edge detection
+};
+function emptyHand() {
+  return {
+    pose: null,
+    grip: 0, trigger: 0,
+    buttons: { a:0, b:0, x:0, y:0, thumb:0, menu:0 },
+  };
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Multi-fleet robot selection (§10)
+//   URL ?robot=N → 첫 WS 메시지로 {"select_robot": N} 전송
+//   기본값은 1. mac_proxy 가 select_robot 메시지를 받아 robot_id 메타로 보관.
+// ───────────────────────────────────────────────────────────────────────────
+const ROBOT_ID = (() => {
+  const v = parseInt(new URLSearchParams(location.search).get("robot") || "1", 10);
+  return Number.isFinite(v) && v > 0 ? v : 1;
+})();
+logLine(`robot_id = ${ROBOT_ID}`);
+
+// ───────────────────────────────────────────────────────────────────────────
+// WebSocket pose channel
+//   M0b 단계는 echo, M3+ 부터 mac_proxy 가 받아 ZMQ PUB 로 forward (§4.2).
+//   /ws 미연결이어도 페이지는 정상 동작.
+// ───────────────────────────────────────────────────────────────────────────
+let ws = null;
+function openWS() {
+  try {
+    const url = `wss://${location.host}/ws`;
+    ws = new WebSocket(url);
+    ws.onopen = () => {
+      logLine(`ws open → ${url}`, "ok");
+      try {
+        ws.send(JSON.stringify({ select_robot: ROBOT_ID }));
+      } catch {}
+    };
+    ws.onclose   = () => logLine(`ws closed`, "err");
+    ws.onerror   = (e) => logLine(`ws error`, "err");
+    ws.onmessage = (m) => { /* server heartbeat — ignore for now */ };
+  } catch (e) {
+    logLine(`ws open exception: ${e.message}`, "err");
+  }
+}
+openWS();
+
+// ───────────────────────────────────────────────────────────────────────────
+// WebRTC video — page is CONSUMER (recvonly).
+//   계획서 §4.2: Mac 이 selective forwarder, Home Server 트랙을 페이지로 relay.
+//   페이지는 mac_proxy 의 /signaling/quest WSS 에 붙어 offer/answer + ICE 교환.
+//   트랙이 도착하면 <video> 의 srcObject 를 그 MediaStream 으로 바꾼다 →
+//   VideoTexture 가 자동으로 새 소스로 갱신된다.
+//   WebRTC 미연결 / 트랙 없음 상태에서는 demo.mp4 가 계속 흐름 (M0b fallback).
+//
+//   signaling 포트는 :8444 (페이지/WSS 포즈는 :8443). 동일 호스트, 동일 자기서명
+//   인증서를 양 포트가 공유 — 브라우저는 origin 가 달라도 WSS 자체는 허용한다.
+// ───────────────────────────────────────────────────────────────────────────
+const SIGNAL_PORT_OFFSET = 1;   // :8443 → :8444. 운영에선 query 로 override 가능.
+const SIGNAL_PORT = (() => {
+  const q = parseInt(new URLSearchParams(location.search).get("signal_port") || "", 10);
+  if (Number.isFinite(q) && q > 0) return q;
+  const cur = parseInt(location.port || "443", 10);
+  return cur + SIGNAL_PORT_OFFSET;
+})();
+
+let videoPC = null;
+let signalingWS = null;
+let webrtcActive = false;
+
+async function openWebRTC() {
+  const url = `wss://${location.hostname}:${SIGNAL_PORT}/signaling/quest`;
+  try {
+    signalingWS = new WebSocket(url);
+    await new Promise((resolve, reject) => {
+      signalingWS.addEventListener("open", resolve, { once: true });
+      signalingWS.addEventListener("error", reject, { once: true });
+    });
+    logLine(`signaling open → ${url}`, "ok");
+  } catch (e) {
+    logLine(`signaling open failed (video plane → demo.mp4 fallback)`, "err");
+    return;
+  }
+
+  videoPC = new RTCPeerConnection();
+  // recvonly video transceiver — Mac proxy 가 sendonly 로 응답함
+  videoPC.addTransceiver("video", { direction: "recvonly" });
+
+  videoPC.ontrack = (ev) => {
+    const stream = ev.streams[0] || new MediaStream([ev.track]);
+    $video.srcObject = stream;
+    $video.removeAttribute("src");     // file source 해제 — srcObject 가 우선
+    $video.play().catch(() => {});
+    webrtcActive = true;
+    logLine("video track attached (WebRTC live)", "ok");
+    ev.track.onended = () => {
+      webrtcActive = false;
+      // 다시 파일 fallback. srcObject 해제 후 src 복원.
+      $video.srcObject = null;
+      $video.src = "./assets/demo.mp4";
+      $video.play().catch(() => {});
+      logLine("video track ended → demo.mp4 fallback", "err");
+    };
+  };
+
+  videoPC.onicecandidate = ({ candidate }) => {
+    // trickle ICE 송신
+    if (!signalingWS || signalingWS.readyState !== WebSocket.OPEN) return;
+    if (candidate) {
+      signalingWS.send(JSON.stringify({
+        type: "candidate",
+        candidate: candidate.candidate,
+        sdpMid: candidate.sdpMid,
+        sdpMLineIndex: candidate.sdpMLineIndex,
+      }));
+    } else {
+      signalingWS.send(JSON.stringify({ type: "candidate", candidate: null }));
+    }
+  };
+
+  videoPC.onconnectionstatechange = () => {
+    logLine(`webrtc state=${videoPC.connectionState}`);
+  };
+
+  signalingWS.onmessage = async (m) => {
+    let data;
+    try { data = JSON.parse(m.data); } catch { return; }
+    if (data.type === "answer") {
+      await videoPC.setRemoteDescription({ type: "answer", sdp: data.sdp });
+    } else if (data.type === "candidate" && data.candidate) {
+      try {
+        await videoPC.addIceCandidate({
+          candidate: data.candidate,
+          sdpMid: data.sdpMid,
+          sdpMLineIndex: data.sdpMLineIndex,
+        });
+      } catch (e) {
+        logLine(`addIceCandidate err: ${e.message}`, "err");
+      }
+    }
+  };
+
+  signalingWS.onclose = () => logLine("signaling closed", "err");
+
+  // offer 송신
+  try {
+    const offer = await videoPC.createOffer();
+    await videoPC.setLocalDescription(offer);
+    signalingWS.send(JSON.stringify({ type: "offer", sdp: offer.sdp }));
+  } catch (e) {
+    logLine(`createOffer failed: ${e.message}`, "err");
+  }
+}
+openWebRTC();
+
+// ───────────────────────────────────────────────────────────────────────────
+// VR session entry
+// ───────────────────────────────────────────────────────────────────────────
+let xrRefSpace = null;
+$enter.addEventListener("click", async () => {
+  try {
+    const session = await navigator.xr.requestSession("immersive-vr", {
+      requiredFeatures: ["local-floor"],
+      optionalFeatures: ["hand-tracking"],
+    });
+    renderer.xr.setReferenceSpaceType("local-floor");
+    await renderer.xr.setSession(session);
+    xrRefSpace = await session.requestReferenceSpace("local-floor");
+    logLine("immersive-vr session started (local-floor)", "ok");
+    $video.play().catch(() => { /* autoplay may already have run */ });
+    session.addEventListener("end", () => {
+      xrRefSpace = null;
+      logLine("immersive-vr session ended");
+    });
+  } catch (e) {
+    logLine(`requestSession failed: ${e.message}`, "err");
+  }
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Per-frame: read poses + gamepad, update state, draw HUD, send WS payload
+// ───────────────────────────────────────────────────────────────────────────
+const POSE_SEND_HZ = 90;       // §4.1: "WebSocket payload (90 Hz)"
+let lastSendT = 0;
+
+renderer.setAnimationLoop((time, frame) => {
+  if (frame && xrRefSpace) {
+    const session = renderer.xr.getSession();
+    const viewerPose = frame.getViewerPose(xrRefSpace);
+    if (viewerPose) {
+      const t = viewerPose.transform;
+      state.hmd = [t.position.x, t.position.y, t.position.z,
+                   t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w];
+    }
+    // input sources
+    state.left  = emptyHand(); state.right = emptyHand();
+    for (const src of session.inputSources) {
+      if (!src.gripSpace || !src.gamepad) continue;
+      const gp = src.gamepad;
+      const hand = src.handedness === "left" ? "left"
+                 : src.handedness === "right" ? "right" : null;
+      if (!hand) continue;
+      const pose = frame.getPose(src.gripSpace, xrRefSpace);
+      const meshIdx = hand === "right" ? 0 : 1;
+      if (pose) {
+        const p = pose.transform.position;
+        const q = pose.transform.orientation;
+        controllerMeshes[meshIdx].visible = true;
+        controllerMeshes[meshIdx].position.set(p.x, p.y, p.z);
+        controllerMeshes[meshIdx].quaternion.set(q.x, q.y, q.z, q.w);
+        state[hand].pose = [p.x, p.y, p.z, q.x, q.y, q.z, q.w];
+      } else {
+        controllerMeshes[meshIdx].visible = false;
+      }
+      // Quest Touch Plus button index map (Meta WebXR profile)
+      // 0=trigger 1=grip 2=(reserved) 3=thumbstick-click 4=A/X 5=B/Y
+      const b = (i) => (gp.buttons[i] ? gp.buttons[i].value : 0);
+      const pressed = (i) => (gp.buttons[i] ? gp.buttons[i].pressed : false);
+      state[hand].trigger = b(0);
+      state[hand].grip    = b(1);
+      const isRight = hand === "right";
+      state[hand].buttons = {
+        a:    isRight ? +pressed(4) : 0,
+        x:    isRight ? 0           : +pressed(4),
+        b:    isRight ? +pressed(5) : 0,
+        y:    isRight ? 0           : +pressed(5),
+        thumb: +pressed(3),
+        menu:  0,            // OS-reserved on Quest, not exposed to page
+      };
+      // edge-detect special buttons (§4.1)
+      const prev = state.prevButtons[hand];
+      // B (right) / Y (left) → estop latched
+      if (state[hand].buttons.b && !prev.b) {
+        state.estop = true; logLine(`E-STOP latched (${hand} B)`, "err");
+      }
+      if (state[hand].buttons.y && !prev.y) {
+        state.estop = true; logLine(`E-STOP latched (${hand} Y)`, "err");
+      }
+      // A (right) / X (left) → anchor reset pulse (§4.1)
+      if (state[hand].buttons.a && !prev.a) {
+        state.anchorResetPulse.right = performance.now();
+        logLine(`anchor reset (right A)`);
+      }
+      if (state[hand].buttons.x && !prev.x) {
+        state.anchorResetPulse.left = performance.now();
+        logLine(`anchor reset (left X)`);
+      }
+      // thumbstick click → M0b 단계 e-stop release fallback (§8 M0b 비고).
+      // 계획서 §4.1 은 menu long-press 1s 를 적었지만 menu 는 Quest OS 가 가로챈다.
+      // M0b 가 page JS 도달 여부를 검증하므로, 안 잡히면 §7 결정 단계에서 다른 경로
+      // (예: trigger half-press)로 교체.
+      if (state[hand].buttons.thumb && !prev.thumb) {
+        if (state.estop) {
+          state.estop = false;
+          logLine(`E-STOP released (${hand} thumb click)`, "ok");
+        } else {
+          logLine(`thumb click (${hand})`);
+        }
+      }
+      state.prevButtons[hand] = { ...state[hand].buttons };
+    }
+    // throttled WS send
+    const now = performance.now();
+    if (ws && ws.readyState === WebSocket.OPEN && now - lastSendT >= 1000 / POSE_SEND_HZ) {
+      lastSendT = now;
+      ws.send(JSON.stringify({
+        t: Math.round(now),
+        hmd: state.hmd,
+        left: { pose: state.left.pose,  grip: state.left.grip,
+                trigger: state.left.trigger,  buttons: state.left.buttons },
+        right:{ pose: state.right.pose, grip: state.right.grip,
+                trigger: state.right.trigger, buttons: state.right.buttons },
+        estop: state.estop,
+      }));
+    }
+    drawHUD();
+  }
+  renderer.render(scene, camera);
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// HUD draw (canvas, updated every frame)
+// ───────────────────────────────────────────────────────────────────────────
+function drawHUD() {
+  const c = hudCtx;
+  c.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
+  c.fillStyle = "rgba(15, 23, 42, 0.85)";
+  c.fillRect(0, 0, hudCanvas.width, hudCanvas.height);
+
+  c.fillStyle = "#67e8f9"; c.font = "bold 28px sans-serif";
+  c.fillText("XLerobot WebXR · M0b", 24, 40);
+
+  c.font = "16px ui-monospace, monospace"; c.fillStyle = "#cbd5e1";
+  c.fillText(`hmd : ${fmtPose(state.hmd)}`, 24, 80);
+  c.fillText(`L   : ${fmtPose(state.left.pose)}`, 24, 104);
+  c.fillText(`R   : ${fmtPose(state.right.pose)}`, 24, 128);
+
+  // analog
+  drawBar(c,  24, 160, "L grip",    state.left.grip);
+  drawBar(c, 280, 160, "L trigger", state.left.trigger);
+  drawBar(c,  24, 200, "R grip",    state.right.grip);
+  drawBar(c, 280, 200, "R trigger", state.right.trigger);
+
+  // buttons
+  c.font = "bold 18px sans-serif"; c.fillStyle = "#94a3b8";
+  c.fillText("buttons (left)",  24, 250);
+  c.fillText("buttons (right)", 24, 360);
+  drawButtonsRow(c,  24, 270, state.left.buttons,  ["x","y","thumb","menu"]);
+  drawButtonsRow(c,  24, 380, state.right.buttons, ["a","b","thumb","menu"]);
+
+  // estop pill
+  c.font = "bold 22px sans-serif";
+  if (state.estop) {
+    c.fillStyle = "#f43f5e";
+    c.fillRect(700, 24, 280, 48);
+    c.fillStyle = "#fff";
+    c.textAlign = "center";
+    c.fillText("E-STOP LATCHED", 840, 56);
+    c.textAlign = "left";
+  } else {
+    c.fillStyle = "#1e293b";
+    c.fillRect(700, 24, 280, 48);
+    c.fillStyle = "#94a3b8";
+    c.textAlign = "center";
+    c.fillText("ready", 840, 56);
+    c.textAlign = "left";
+  }
+  // webrtc + robot_id small line
+  c.font = "13px ui-monospace, monospace";
+  c.fillStyle = webrtcActive ? "#34d399" : "#fbbf24";
+  c.fillText(
+    `robot=${ROBOT_ID}  video=${webrtcActive ? "WebRTC live" : "demo.mp4 fallback"}`,
+    700, 138
+  );
+
+  // anchor reset flashes
+  const now = performance.now();
+  ["left","right"].forEach((h, i) => {
+    const age = now - state.anchorResetPulse[h];
+    if (age < 500) {
+      const a = 1 - age / 500;
+      c.fillStyle = `rgba(52, 211, 153, ${a.toFixed(2)})`;
+      c.fillRect(700 + i*140, 90, 130, 36);
+      c.fillStyle = "#0a0e14"; c.font = "bold 14px sans-serif";
+      c.textAlign = "center";
+      c.fillText(`${h} anchor↺`, 765 + i*140, 113);
+      c.textAlign = "left";
+    }
+  });
+
+  hudTex.needsUpdate = true;
+}
+function fmtPose(p) {
+  if (!p) return "—";
+  const f = (n) => n.toFixed(3).padStart(7);
+  return `(${f(p[0])} ${f(p[1])} ${f(p[2])})  q(${f(p[3])} ${f(p[4])} ${f(p[5])} ${f(p[6])})`;
+}
+function drawBar(c, x, y, label, v) {
+  c.fillStyle = "#94a3b8"; c.font = "13px sans-serif";
+  c.fillText(label, x, y - 4);
+  c.fillStyle = "#1e293b"; c.fillRect(x, y, 220, 14);
+  c.fillStyle = "#06b6d4"; c.fillRect(x, y, 220 * Math.max(0, Math.min(1, v)), 14);
+  c.fillStyle = "#cbd5e1"; c.font = "12px ui-monospace, monospace";
+  c.fillText(v.toFixed(2), x + 228, y + 12);
+}
+function drawButtonsRow(c, x, y, btns, keys) {
+  let cx = x;
+  for (const k of keys) {
+    const on = !!btns[k];
+    c.fillStyle = on ? "#06b6d4" : "#1e293b";
+    c.fillRect(cx, y, 90, 32);
+    c.fillStyle = on ? "#0a0e14" : "#94a3b8";
+    c.font = "bold 16px sans-serif";
+    c.textAlign = "center";
+    c.fillText(k.toUpperCase(), cx + 45, y + 22);
+    c.textAlign = "left";
+    cx += 100;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// resize
+// ───────────────────────────────────────────────────────────────────────────
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>

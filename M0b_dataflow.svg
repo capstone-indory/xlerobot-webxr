@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 540" font-family="ui-sans-serif, -apple-system, system-ui">
+  <defs>
+    <style>
+      .title { font-size: 22px; font-weight: 700; fill: #0f172a; }
+      .sub   { font-size: 13px; fill: #64748b; }
+      .box-h { font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .lbl   { font-size: 12px; fill: #334155; }
+      .small { font-size: 11px; fill: #64748b; }
+      .pill  { font-size: 11px; font-weight: 600; }
+      .quest   { fill: #ecfeff; stroke: #06b6d4; }
+      .mac     { fill: #f1f5f9; stroke: #94a3b8; }
+      .future  { fill: #fef3c7; stroke: #d97706; stroke-dasharray: 4 4; }
+      .frame   { fill: #ffffff; stroke: #cbd5e1; }
+      .arrow   { stroke: #475569; stroke-width: 1.6; fill: none; marker-end: url(#ah); }
+      .arrow-future { stroke: #d97706; stroke-width: 1.6; fill: none; marker-end: url(#ahf); stroke-dasharray: 4 4; }
+      .check { font-size: 13px; font-weight: 700; fill: #16a34a; }
+    </style>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <marker id="ahf" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d97706"/>
+    </marker>
+  </defs>
+
+  <text x="490" y="32" text-anchor="middle" class="title">XLerobot WebXR — M0b 데이터 흐름</text>
+  <text x="490" y="54" text-anchor="middle" class="sub">실선 = M0b 에서 동작. 점선(주황) = M3/M5 통합 시 켜질 경로.</text>
+
+  <!-- LEFT: Quest 3 -->
+  <g transform="translate(40,90)">
+    <rect class="quest" x="0" y="0" width="320" height="380" rx="12"/>
+    <text x="160" y="26" text-anchor="middle" class="box-h">Quest 3 / Quest Browser</text>
+
+    <rect class="frame" x="20" y="50" width="280" height="60" rx="6"/>
+    <text x="160" y="72" text-anchor="middle" class="lbl" font-weight="600">XR session: immersive-vr</text>
+    <text x="160" y="92" text-anchor="middle" class="small">requiredFeatures: ['local-floor']</text>
+
+    <rect class="frame" x="20" y="125" width="280" height="80" rx="6"/>
+    <text x="160" y="145" text-anchor="middle" class="lbl" font-weight="600">XRFrame.getViewerPose / getPose</text>
+    <text x="160" y="163" text-anchor="middle" class="small">HMD 6DoF · L/R gripSpace 6DoF</text>
+    <text x="160" y="180" text-anchor="middle" class="small">XRInputSource.gamepad → 버튼/스틱</text>
+    <text x="160" y="197" text-anchor="middle" class="small">90Hz</text>
+
+    <rect class="frame" x="20" y="220" width="280" height="60" rx="6"/>
+    <text x="160" y="240" text-anchor="middle" class="lbl" font-weight="600">three.js 씬</text>
+    <text x="160" y="258" text-anchor="middle" class="small">video plane (VideoTexture) · HUD canvas</text>
+    <text x="160" y="273" text-anchor="middle" class="small">controller spheres · grid floor</text>
+
+    <rect class="frame" x="20" y="295" width="280" height="70" rx="6"/>
+    <text x="160" y="315" text-anchor="middle" class="lbl" font-weight="600">edge detect (B/Y → estop, A/X → anchor)</text>
+    <text x="160" y="333" text-anchor="middle" class="small">thumb click → e-stop release fallback</text>
+    <text x="160" y="350" text-anchor="middle" class="small">menu 는 OS 가로챔 — page JS 안 옴</text>
+  </g>
+
+  <!-- MIDDLE: Mac (this is what serve.py does today) -->
+  <g transform="translate(420,90)">
+    <rect class="mac" x="0" y="0" width="280" height="380" rx="12"/>
+    <text x="140" y="26" text-anchor="middle" class="box-h">Mac · serve.py (M0b)</text>
+
+    <rect class="frame" x="20" y="50" width="240" height="80" rx="6"/>
+    <text x="140" y="70" text-anchor="middle" class="lbl" font-weight="600">aiohttp HTTPS :8443</text>
+    <text x="140" y="88" text-anchor="middle" class="small">자기서명 cert (openssl 생성)</text>
+    <text x="140" y="105" text-anchor="middle" class="small">/ → index.html</text>
+    <text x="140" y="120" text-anchor="middle" class="small">/assets/demo.mp4</text>
+
+    <rect class="frame" x="20" y="145" width="240" height="70" rx="6"/>
+    <text x="140" y="165" text-anchor="middle" class="lbl" font-weight="600">/ws  WebSocket echo</text>
+    <text x="140" y="183" text-anchor="middle" class="small">page → 90Hz JSON pose 수신</text>
+    <text x="140" y="200" text-anchor="middle" class="small">서버 로그에 estop/버튼 이벤트만 기록</text>
+
+    <rect class="future" x="20" y="240" width="240" height="120" rx="6"/>
+    <text x="140" y="260" text-anchor="middle" class="lbl" font-weight="600">M3/M5 — Mac proxy 로 승격</text>
+    <text x="140" y="278" text-anchor="middle" class="small">+ ZMQ PUB tcp://0.0.0.0:7001</text>
+    <text x="140" y="294" text-anchor="middle" class="small">  (Tailscale 인터페이스로 publish)</text>
+    <text x="140" y="312" text-anchor="middle" class="small">+ aiortc ICE relay</text>
+    <text x="140" y="328" text-anchor="middle" class="small">  (LAN en0 + Tailscale utun 양쪽 host candidate)</text>
+    <text x="140" y="346" text-anchor="middle" class="small">+ ?robot=N 메타 부착</text>
+  </g>
+
+  <!-- RIGHT: Future hops -->
+  <g transform="translate(740,90)">
+    <rect class="future" x="0" y="0" width="200" height="380" rx="12"/>
+    <text x="100" y="26" text-anchor="middle" class="box-h">Home Server (M2+)</text>
+
+    <rect class="frame" x="15" y="55" width="170" height="80" rx="6"/>
+    <text x="100" y="75" text-anchor="middle" class="lbl" font-weight="600">VR teleop bridge</text>
+    <text x="100" y="93" text-anchor="middle" class="small">Quest pose → workspace</text>
+    <text x="100" y="108" text-anchor="middle" class="small">retargeting · twist-swing</text>
+    <text x="100" y="124" text-anchor="middle" class="small">absolute EE target</text>
+
+    <rect class="frame" x="15" y="150" width="170" height="80" rx="6"/>
+    <text x="100" y="170" text-anchor="middle" class="lbl" font-weight="600">indoory_isaac_sim</text>
+    <text x="100" y="188" text-anchor="middle" class="small">arm_ee_pose_target</text>
+    <text x="100" y="203" text-anchor="middle" class="small">DLS IK + shoulder_pan</text>
+    <text x="100" y="219" text-anchor="middle" class="small">+ workspace clamp</text>
+
+    <rect class="frame" x="15" y="245" width="170" height="115" rx="6"/>
+    <text x="100" y="265" text-anchor="middle" class="lbl" font-weight="600">M8 — NVENC + WebRTC</text>
+    <text x="100" y="284" text-anchor="middle" class="small">rgb.front (head camera)</text>
+    <text x="100" y="300" text-anchor="middle" class="small">→ H.264 → RTP</text>
+    <text x="100" y="316" text-anchor="middle" class="small">via Mac SFU/relay</text>
+    <text x="100" y="334" text-anchor="middle" class="small">M9 prerequisite:</text>
+    <text x="100" y="349" text-anchor="middle" class="small">frame_meta.&lt;i&gt; ZMQ</text>
+  </g>
+
+  <!-- arrows -->
+  <!-- Quest → Mac (ws pose) -->
+  <path class="arrow" d="M360 175 C 390 175, 400 175, 420 175"/>
+  <text x="390" y="166" text-anchor="middle" class="small">wss pose 90Hz</text>
+
+  <!-- Mac → Quest (HTTP page + mp4 + ws heartbeat) -->
+  <path class="arrow" d="M420 100 C 400 100, 390 100, 360 100"/>
+  <text x="390" y="91" text-anchor="middle" class="small">HTTPS · /ws hb</text>
+
+  <!-- Mac proxy (M3+) → Home Server -->
+  <path class="arrow-future" d="M700 295 C 720 295, 720 200, 740 200"/>
+  <text x="720" y="180" text-anchor="middle" class="small" fill="#d97706">ZMQ PUB</text>
+  <text x="720" y="194" text-anchor="middle" class="small" fill="#d97706">(Tailscale)</text>
+
+  <!-- Home Server → Mac (M8 video) -->
+  <path class="arrow-future" d="M740 320 C 720 320, 720 145, 700 145"/>
+  <text x="725" y="135" text-anchor="middle" class="small" fill="#d97706">RTP/WebRTC</text>
+
+  <!-- M0b 검증 통과 체크리스트 -->
+  <g transform="translate(40,490)">
+    <text x="0" y="0" class="check">✓ M0b (i)  immersive-vr 진입</text>
+    <text x="220" y="0" class="check">✓ M0b (ii) &lt;video&gt; 동시 렌더링</text>
+    <text x="470" y="0" class="check">✓ M0b (iii) B/Y/A/X page JS 도달 (HUD 시각화)</text>
+    <text x="0" y="20" class="small">└ 시연 검증은 Quest Browser 에서 직접 — 통과 시 M1/M2 진입.</text>
+  </g>
+</svg>
