@@ -5,7 +5,7 @@ M0b 단계용 최소 HTTPS 정적 호스팅 서버.
 
 목적
 ----
-Quest 브라우저는 WebXR `immersive-vr` 세션을 secure context(HTTPS)에서만 허용한다.
+Quest 브라우저는 WebXR `immersive-ar` 세션을 secure context(HTTPS)에서만 허용한다.
 계획서 §10 "HTTPS 인증서"는 운영용으로 Caddy + Let's Encrypt DNS-01을 권장하지만,
 M0b 단계의 hello-world 검증에는 LAN 안에서 도는 자기서명 인증서면 충분하다.
 
@@ -59,7 +59,7 @@ log = logging.getLogger("webxr-serve")
 def ensure_dev_cert() -> None:
     """Generate a self-signed cert valid for LAN use if not present.
 
-    Quest Browser refuses to enter immersive-vr on HTTP. We need HTTPS even
+    Quest Browser refuses to enter immersive-ar on HTTP. We need HTTPS even
     in dev. mkcert is more polished but the Quest user-CA store is fiddly
     (계획서 §10), so for M0b we use the simplest possible path: openssl
     self-signed, browser prompts the user to accept once.

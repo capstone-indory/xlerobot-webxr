@@ -9,7 +9,7 @@ demo.mp4 를 video track 으로 publish 한다 — Home Server WebRTC 통합(M8)
 검증 시나리오 (계획서 §8 M3):
   1) Mac:    python3 tools/mac_proxy.py
   2) Server: python3 tools/fake_producer.py            # 이 스크립트
-  3) Quest:  https://<mac-lan-ip>:8443/?robot=1
+  3) Quest:  https://<mac-lan-ip>:8443/?robot=0
      → 페이지의 video plane 에 demo.mp4 가 WebRTC 트랙으로 흘러와야 함
      (페이지가 WebRTC 트랙을 잡으면 demo.mp4 자체 재생을 그 트랙으로 교체)
 
