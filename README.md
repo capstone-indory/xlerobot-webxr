@@ -211,6 +211,106 @@ python examples/vr_teleop_bridge.py \
 tick 에서 anchor 를 잡고, 이후 right controller delta 를 robot base frame 으로 변환해
 sim `:5556` PULL 로 `arm_ee_pose_target.right` 를 보낸다.
 
+Home Server bridge 없이 이 repo에서 바로 Quest/WebXR pose를 sim arm target으로
+연결하려면 Mac 쪽에서 direct bridge를 같이 띄운다:
+
+```bash
+python3 tools/run.py \
+  --vr-direct-teleop \
+  --video-source none \
+  --sim-host 100.80.87.68 \
+  --sim-robot-id 0
+```
+
+이 모드는 `mac_proxy.py`가 `pose.<robot_id>`를 publish하고,
+`tools/vr_direct_teleop.py`가 그 pose를 SUB해서 sim `:5556`으로 직접 PUSH한다.
+오른쪽 grip을 0.5 이상 잡은 첫 frame에서 anchor를 캡처하고, 이후 controller 위치
+delta를 EE target delta로 변환한다. Quest 없이 bridge 자체만 확인할 때는 synthetic
+pose source로 sim arm 이동량을 바로 측정한다:
+
+```bash
+python3 tools/vr_direct_teleop.py \
+  --source synthetic \
+  --sim-host 100.80.87.68 \
+  --robot-id 0 \
+  --duration-s 5
+```
+
+Quest 없이 키보드로 sim 팔만 움직이려면 Mac 쪽에서 별도 non-VR 웹 서버를 띄운다.
+이 경로는 `tf.links.<robot_id>`에서 최신 left/right gripper pose를 읽고, 브라우저의
+W/S/R/F jog 입력을 `xlerobot_v1.1 arm_ee_pose_target`으로 변환해 sim `:5556`으로
+직접 PUSH한다. sim 쪽 IK target slot을 안정적으로 먹이기 위해 매 command마다
+선택한 팔 target과 반대쪽 팔 hold target을 같이 보낸다:
+
+```bash
+python3 tools/run.py \
+  --keyboard-teleop \
+  --sim-host 100.80.87.68 \
+  --sim-robot-id 0
+```
+
+브라우저에서 `http://127.0.0.1:8765/?robot=0`을 열면 키보드 입력만으로 오른팔
+EE target이 움직인다. 기본 EE nudge는 `step=0.03`m이다. W/S는 위/아래, R/F는 앞/뒤 EE target nudge, A/D는
+shoulder pan, Z/X는 gripper delta다. EE nudge는 `tf.links.<robot_id>`에서 잡은
+anchor 기준 offset으로 누적되고, 기본 `--max-offset 0.12`m 범위로 clamp된다.
+입력 직후에는 서버가 최신 EE target을 기본 5초 동안 60Hz로 유지 송신한다. sim은
+PULL 큐를 최신 명령 위주로 처리하지만, 실제 EE pose target은 짧은 one-shot보다
+몇 초간 유지 송신할 때 안정적으로 반영된다.
+버튼은 JS pointer/keyboard handler가 실패해도 같은 동작을 `POST /api/nudge`
+form fallback으로 보낸다. 이 경로는 WebXR session, Quest, WebRTC video,
+VR bridge를 시작하지 않는다.
+
+같은 `robot_id`에 여러 teleop/bridge 프로세스나 오래 열린 브라우저 탭이 동시에
+명령을 보내면 sim의 last-writer-wins 정책 때문에 서로 target을 덮어쓴다. 지연처럼
+보이거나 움직임이 끊기면 먼저 `pgrep -fl 'keyboard_teleop|vr_direct_teleop|tools/run.py'`
+로 중복 writer를 확인한다.
+
+동일 서버를 단독 스크립트로 직접 띄우려면:
+
+```bash
+python3 tools/keyboard_teleop.py \
+  --sim-host 100.80.87.68 \
+  --robot-id 0
+```
+
+웹 서버까지 포함한 입력 경로를 CLI에서 확인하려면:
+
+```bash
+curl -X POST http://127.0.0.1:8765/api/nudge \
+  -d code=KeyW
+```
+
+웹 입력 경로를 건너뛰고 sim arm이 ZMQ command로 움직이는지만 바로 확인하려면:
+
+```bash
+python3 tools/sim_nudge.py \
+  --sim-host 100.80.87.68 \
+  --robot-id 0 \
+  --side right \
+  --dx 0.02 \
+  --dz -0.015
+```
+
+EE target이 실제 `tf.links` pose로 얼마나 정확히 수렴하는지 확인하려면 waypoint
+검증 시나리오를 실행한다. 현재 gripper pose를 anchor로 잡고 `x/y/z` 단독 이동,
+center 복귀, x-z 대각 이동을 순회하며 각 target의 최종 오차와 최소 오차를 CSV/JSONL로
+남긴다:
+
+```bash
+python3 tools/ee_target_verify.py \
+  --sim-host 100.80.87.68 \
+  --robot-id 0 \
+  --side right \
+  --settle-s 4.0 \
+  --observe-s 1.0 \
+  --tolerance 0.012 \
+  --out tools/reports/ee_target_verify_right_full
+```
+
+`status=fail`인 row는 IK가 해당 target에 tolerance 안으로 수렴하지 못한 지점이다.
+`target_xyz`, `final_xyz`, `final_error_m`, `first_move_s`를 보면 어떤 방향/좌표에서
+오차가 나는지 바로 재현할 수 있다.
+
 ## M3 통과 기준 (계획서 §8 row "3")
 
 | # | 검증 항목 | 확인 방법 |
