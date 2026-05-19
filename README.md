@@ -129,6 +129,39 @@ https://<mac-lan-ip>:8443/?robot=0&dev_no_controller=1
 
 이 모드는 HMD 앞쪽에 synthetic right-hand pose 를 만들고 `right.grip=1.0` 을 계속 보내
 clutch-on 상태를 흉내낸다. 실제 로봇에는 쓰지 말고 sim/demo 검증용으로만 사용.
+trigger close 경로까지 같이 검증하려면 `dev_trigger` 를 0..1 로 추가한다:
+
+```text
+https://<mac-lan-ip>:8443/?robot=0&dev_no_controller=1&dev_trigger=1
+```
+
+Home Server 에서 Mac proxy, sim, `examples/vr_teleop_bridge.py` 가 모두 떠 있는 상태라면
+Quest 없이 전체 입력 경로를 확인할 수 있다:
+
+```bash
+python3 tools/teleop_probe.py \
+  --mac-host <mac-tailscale-ip> \
+  --sim-host 127.0.0.1 \
+  --robot-id 0
+```
+
+이 probe 는 synthetic page payload 를 Mac `/ws` 로 보내 `pose.0` ZMQ publish 를 확인하고,
+같은 payload 가 Home Server 의 VR bridge 를 거쳐 sim `tf.links.0/gripper_right` 에
+표현되는지 측정한다. trigger close 까지 보려면 `--gripper` 를 추가한다:
+
+```bash
+python3 tools/teleop_probe.py \
+  --mac-host <mac-tailscale-ip> \
+  --sim-host 127.0.0.1 \
+  --robot-id 0 \
+  --gripper
+```
+
+`--gripper` 는 sim Jaw 를 직접 한 번 열어 둔 뒤 Mac trigger payload 가 VR bridge 를 통해
+Jaw 를 다시 닫는지 측정한다. `direct open` 은 되는데 `trigger close` 가 안 되면 Mac
+proxy 가 아니라 Home Server bridge 실행, `estop`, `right.grip`, 또는 trigger→gripper
+sign/slot 쪽을 본다. 초기 Jaw 가 이미 닫혀 있으면 trigger close 만으로는 눈에 띄는
+변화가 없으므로 gripper 검증은 반드시 먼저 열어 둔 상태에서 해석한다.
 
 ### 3. 비디오 소스 — 세 가지 중 하나 선택
 

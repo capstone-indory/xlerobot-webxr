@@ -353,8 +353,16 @@ const DEV_NO_CONTROLLER = (() => {
   const v = (QUERY.get("dev_no_controller") || "").toLowerCase();
   return ["1", "true", "yes", "on"].includes(v);
 })();
+const DEV_TRIGGER = (() => {
+  const v = parseFloat(QUERY.get("dev_trigger") || "0");
+  if (!Number.isFinite(v)) return 0.0;
+  return Math.max(0.0, Math.min(1.0, v));
+})();
 if (DEV_NO_CONTROLLER) {
   logLine("DEV no-controller mode: synthetic right grip enabled", "err");
+  if (DEV_TRIGGER > 0.0) {
+    logLine(`DEV synthetic right trigger=${DEV_TRIGGER.toFixed(2)}`, "err");
+  }
 }
 
 const _tmpPos = new THREE.Vector3();
@@ -521,7 +529,7 @@ function applyNoControllerDevFallback(seenHands) {
   if (!seenHands.right) {
     state.right = synthHandFromHmd("right");
     state.right.grip = 1.0;
-    state.right.trigger = 0.0;
+    state.right.trigger = DEV_TRIGGER;
     controllerMeshes[0].visible = !!state.right.pose;
     if (state.right.pose) {
       controllerMeshes[0].position.set(
