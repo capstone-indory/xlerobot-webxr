@@ -32,7 +32,7 @@
     <text x="160" y="26" text-anchor="middle" class="box-h">Quest 3 / Quest Browser</text>
 
     <rect class="frame" x="20" y="50" width="280" height="60" rx="6"/>
-    <text x="160" y="72" text-anchor="middle" class="lbl" font-weight="600">XR session: immersive-vr</text>
+    <text x="160" y="72" text-anchor="middle" class="lbl" font-weight="600">XR session: immersive-ar</text>
     <text x="160" y="92" text-anchor="middle" class="small">requiredFeatures: ['local-floor']</text>
 
     <rect class="frame" x="20" y="125" width="280" height="80" rx="6"/>
@@ -123,7 +123,7 @@
 
   <!-- M0b 검증 통과 체크리스트 -->
   <g transform="translate(40,490)">
-    <text x="0" y="0" class="check">✓ M0b (i)  immersive-vr 진입</text>
+    <text x="0" y="0" class="check">✓ M0b (i)  immersive-ar 진입</text>
     <text x="220" y="0" class="check">✓ M0b (ii) &lt;video&gt; 동시 렌더링</text>
     <text x="470" y="0" class="check">✓ M0b (iii) B/Y/A/X page JS 도달 (HUD 시각화)</text>
     <text x="0" y="20" class="small">└ 시연 검증은 Quest Browser 에서 직접 — 통과 시 M1/M2 진입.</text>

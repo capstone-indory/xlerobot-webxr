@@ -1,0 +1,33 @@
+{
+  "schema": "xlerobot_v1.1.page",
+  "frame": "local-floor",
+  "t": 123,
+  "hmd": [0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 1.0],
+  "left": {
+    "pose": null,
+    "grip": 0.0,
+    "trigger": 0.0,
+    "buttons": {
+      "a": 0,
+      "b": 0,
+      "x": 0,
+      "y": 0,
+      "thumb": 0,
+      "menu": 0
+    }
+  },
+  "right": {
+    "pose": [0.25, 1.2, -0.4, 0.0, 0.0, 0.0, 1.0],
+    "grip": 0.5,
+    "trigger": 0.25,
+    "buttons": {
+      "a": 1,
+      "b": 0,
+      "x": 0,
+      "y": 0,
+      "thumb": 0,
+      "menu": 0
+    }
+  },
+  "estop": false
+}

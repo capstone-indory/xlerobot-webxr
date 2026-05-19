@@ -1,11 +1,13 @@
 # xlerobot-webxr / tools requirements
 #
-# mac_proxy.py / fake_producer.py 가 쓰는 패키지.
+# mac_proxy.py / fake_producer.py / sim_video_bridge.py / sim_probe.py / ice_probe.py 가 쓰는 패키지.
 # serve.py(M0b 단순 서버)는 aiohttp 만 있으면 돈다.
 
-aiohttp>=3.9          # HTTPS + WSS 서빙
-pyzmq>=25             # ZMQ PUB (zmq.asyncio)
-msgpack>=1.0          # pose payload 직렬화
+aiohttp>=3.9          # HTTPS + WSS 서빙 (mac_proxy)
+pyzmq>=25             # ZMQ PUB/SUB (zmq.asyncio)
+msgpack>=1.0          # 페이로드 직렬화
 aiortc>=1.9           # WebRTC peer/ICE/SDP, MediaRelay, MediaPlayer
-av>=10.0              # aiortc 가 의존 (PyAV). MediaPlayer 가 demo.mp4 디코드에 사용
-psutil>=5.9           # 기동 시 인터페이스 sanity check (utun 감지). 옵션이지만 강력 권장
+av>=10.0              # aiortc 가 의존 (PyAV). VideoFrame 합성에 사용
+psutil>=5.9           # 인터페이스 sanity check (utun 감지). 옵션이지만 강력 권장
+opencv-python>=4.5    # sim_video_bridge — JPEG decode (스펙 §4.2.3 디코드 패턴)
+numpy>=1.23           # ndarray 핸들링 (opencv 가 이미 의존)

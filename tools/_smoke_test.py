@@ -16,6 +16,7 @@ mac_proxy + fake_producer + 가짜 Quest 를 한 프로세스 안에서 동시�
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ ROOT = pathlib.Path(__file__).resolve().parent
 PROXY = ROOT / "mac_proxy.py"
 PRODUCER = ROOT / "fake_producer.py"
 DEMO_MP4 = ROOT / "webxr" / "assets" / "demo.mp4"
+POSE_FIXTURE = ROOT / "fixtures" / "page_pose_v1_1.json"
 
 # 포트는 일반 기본값과 충돌 안 나도록 시프트
 PROXY_PORT = 18443
@@ -92,20 +94,16 @@ async def _fake_quest_pose(stop: asyncio.Event) -> int:
     url = f"wss://127.0.0.1:{PROXY_PORT}/ws"
     ssl_ctx = _ssl_unverified()
     sent = 0
+    with POSE_FIXTURE.open("r", encoding="utf-8") as f:
+        fixture = json.load(f)
     async with aiohttp.ClientSession() as s:
         async with s.ws_connect(url, ssl=ssl_ctx) as ws:
             await ws.send_json({"select_robot": 7})
             t0 = time.monotonic()
             while not stop.is_set() and time.monotonic() - t0 < 4.0:
-                await ws.send_json({
-                    "t": int((time.monotonic() - t0) * 1000),
-                    "hmd": [0, 1.5, 0, 0, 0, 0, 1],
-                    "left":  {"pose": None, "grip": 0.0, "trigger": 0.0,
-                              "buttons": {"a":0,"b":0,"x":0,"y":0,"thumb":0,"menu":0}},
-                    "right": {"pose": None, "grip": 0.0, "trigger": 0.0,
-                              "buttons": {"a":0,"b":0,"x":0,"y":0,"thumb":0,"menu":0}},
-                    "estop": False,
-                })
+                payload = copy.deepcopy(fixture)
+                payload["t"] = int((time.monotonic() - t0) * 1000)
+                await ws.send_json(payload)
                 sent += 1
                 await asyncio.sleep(1 / 90)
     log.info("fake quest pose sent: %d", sent)
@@ -175,9 +173,13 @@ async def _fake_quest_signaling(stop: asyncio.Event) -> dict:
                 await asyncio.wait_for(track_event.wait(), timeout=10.0)
             except asyncio.TimeoutError:
                 log.warning("fake-quest: no track within 10s")
-            # keep alive until stop event
-            while not stop.is_set():
-                await asyncio.sleep(0.5)
+            deadline = time.monotonic() + 10.0
+            while (
+                not stop.is_set()
+                and result["rtp_frames"] < 5
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.2)
     await pc.close()
     return result
 
@@ -241,12 +243,16 @@ async def main() -> int:
     )
     asyncio.create_task(_stream_logs(prod_proc, "prod "))
 
-    # Let everything run for ~6 seconds
-    await asyncio.sleep(6.0)
-    stop.set()
-
-    sig_result = await quest_signal_task
     pose_count = await quest_pose_task
+    try:
+        sig_result = await asyncio.wait_for(quest_signal_task, timeout=30.0)
+    except asyncio.TimeoutError:
+        log.error("fake quest signaling timed out")
+        sig_result = {"track_seen": False, "rtp_frames": 0, "answer_received": False}
+    finally:
+        stop.set()
+        if not quest_signal_task.done():
+            quest_signal_task.cancel()
     zmq_stats = await zmq_task
 
     # Shutdown
@@ -270,6 +276,7 @@ async def main() -> int:
     print(f"zmq messages on b'pose.7'       : {zmq_stats['count']}")
     print(f"  first robot_id                : {(zmq_stats['first'] or {}).get('robot_id')}")
     print(f"  first schema                  : {(zmq_stats['first'] or {}).get('schema')}")
+    print(f"  first frame                   : {(zmq_stats['first'] or {}).get('frame')}")
     print(f"quest signaling answer received : {sig_result['answer_received']}")
     print(f"quest video track received      : {sig_result['track_seen']}")
     print(f"quest RTP frames drained        : {sig_result['rtp_frames']}")
@@ -281,6 +288,10 @@ async def main() -> int:
         and sig_result["answer_received"]
         and sig_result["track_seen"]
         and sig_result["rtp_frames"] > 0
+        and (zmq_stats["first"] or {}).get("schema") == "xlerobot_v1.1.page"
+        and (zmq_stats["first"] or {}).get("frame") == "local-floor"
+        and (zmq_stats["first"] or {}).get("hmd") == [0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 1.0]
+        and (zmq_stats["first"] or {}).get("right", {}).get("buttons", {}).get("a") == 1
     )
     print("PASS" if ok else "FAIL")
     return 0 if ok else 3

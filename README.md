@@ -14,15 +14,23 @@ XLerobot dual-arm VR teleoperation 시스템의 **Mac + WebXR 클라이언트 �
 xlerobot-webxr/
 ├── README.md
 ├── M0b_dataflow.svg
+├── docs/
+│   └── production_tls.md  ← 운영 전환용 Caddy + Let's Encrypt DNS-01 메모
 ├── .gitignore
 └── tools/
     ├── webxr/
-    │   ├── index.html         ← three.js + WebXR + WebRTC consumer (§4.1)
-    │   ├── serve.py           ← M0b 최소 HTTPS 서버 (echo). M3+ 부터는 mac_proxy 사용
-    │   └── assets/demo.mp4    ← SMPTE bars + 타임코드, 10s
-    ├── mac_proxy.py           ← M3+ 정식 데몬 (§4.2 전체 구현)
-    ├── fake_producer.py       ← M3 검증용 가짜 Home Server (WebRTC video publisher)
-    └── requirements.txt       ← aiohttp, pyzmq, msgpack, aiortc, av, psutil
+    │   ├── index.html          ← three.js + WebXR + WebRTC consumer (§4.1)
+    │   ├── serve.py            ← M0b 최소 HTTPS 서버 (echo). M3+ 부터는 mac_proxy 사용
+    │   └── assets/demo.mp4     ← SMPTE bars + 타임코드, 10s
+    ├── run.py                  ★ 단일 launcher — 한 명령으로 mac_proxy + 비디오 publisher 동시 기동
+    ├── mac_proxy.py            ← M3+ 정식 데몬 (§4.2 전체 구현)
+    ├── fake_producer.py        ← M3 검증용 가짜 Home Server (demo.mp4 loop publisher)
+    ├── sim_video_bridge.py     ← indoory_isaac_sim 의 rgb.front.<i> JPEG → WebRTC track
+    ├── sim_probe.py            ← Tailscale 연결성 + RPC fleet_info + proprio rate 검증
+    ├── ice_probe.py            ← WebRTC ICE host candidate LAN/Tailscale 확인
+    ├── fixtures/
+    │   └── page_pose_v1_1.json ← page → mac payload smoke fixture
+    └── requirements.txt        ← aiohttp, pyzmq, msgpack, aiortc, av, psutil, opencv-python
 ```
 
 ## 포트 / 프로토콜 맵 (§4.2)
@@ -34,7 +42,34 @@ xlerobot-webxr/
 | `:7001` | ZMQ PUB tcp | VR bridge (Home Server) | topic `b"pose.<robot_id>"`, payload msgpack(dict) |
 | `*`     | WebRTC media | Quest ↔ Mac ↔ Home Server | ICE 협상 후 동적 포트, 양 인터페이스(en0, utun) host candidate |
 
-## 실행 (전체 시스템)
+## 실행 — **한 명령으로** (권장)
+
+```bash
+cd ~/Lab/CapstoneDesign/Indory/xlerobot-webxr
+python3 -m pip install -r tools/requirements.txt        # 처음 한 번만
+
+# sim @ 100.80.87.68 의 robot 0 head camera 를 영상 소스로 사용 (default)
+python3 tools/run.py
+
+# 영상 소스 변경
+python3 tools/run.py --sim-robot-id 1                   # 다른 로봇
+python3 tools/run.py --sim-topic rgb.wrist              # wrist 카메라
+python3 tools/run.py --video-source fake                # sim 안 켰을 때 demo.mp4 loop
+python3 tools/run.py --video-source none                # 영상 없이 텔레옵 wire 만
+
+# 도움말
+python3 tools/run.py --help
+```
+
+`Ctrl+C` 한 번으로 두 자식 (mac_proxy + 비디오 publisher) 모두 깔끔 종료. 한쪽이
+비정상 종료하면 다른 쪽도 같이 멈춤 — half-up 상태로 떠 있는 일 없음.
+
+콘솔 출력은 `[proxy ]` / `[video ]` prefix 가 붙어 두 컴포넌트가 한 화면에 합쳐
+보입니다. 메인 페이지 URL 은 `[proxy ]` 첫 블록에 박혀 나옵니다.
+
+## 실행 — 컴포넌트 따로 띄우기 (디버깅용)
+
+각 자식 스크립트는 자기완비라 단독 실행 가능:
 
 ### 1. Mac (이 폴더에서)
 
@@ -64,18 +99,40 @@ network interfaces (ipv4):
 
 ### 2. Quest 3
 
-`https://<mac-lan-ip>:8443/?robot=1` 접속 → 인증서 경고 통과 → *Enter VR*.
+자기서명 개발 인증서를 쓰는 동안은 포트별 origin 예외를 따로 수락해야 한다.
 
-- `?robot=N` 가 없으면 default 1. 페이지는 첫 WS 메시지로 `{"select_robot": N}` 를 보내고,
+1. `https://<mac-lan-ip>:8444/` 접속 → signaling 포트 인증서 예외 수락
+2. `https://<mac-lan-ip>:8443/?robot=0` 접속 → *Enter AR*
+3. 종료할 때는 페이지 overlay 의 *Exit AR* 버튼을 눌러 현재 WebXR session 을 끝낸다.
+
+- `?robot=N` 가 없으면 default 0. 페이지는 첫 WS 메시지로 `{"select_robot": N}` 를 보내고,
   mac_proxy 는 이후 들어오는 모든 pose 페이로드를 토픽 `b"pose.<N>"` 으로 publish.
+- Quest 3/3S 에서는 WebXR `immersive-ar` 세션으로 진입한다. 실제 주변 passthrough 위에
+  head camera video plane, HUD, controller marker 만 오버레이하며 기존 VR fallback 은 없다.
+  `immersive-ar 미지원` 또는 `requestSession(immersive-ar) failed` 가 뜨면 Quest passthrough
+  설정, Quest Browser WebXR AR 지원 상태, HTTPS 인증서 예외를 먼저 확인한다.
 - video plane 은 (a) WebRTC 트랙이 붙어 있으면 그것을, (b) 없으면 `assets/demo.mp4`
   를 흘려보낸다. HUD 의 오른쪽 작은 라인이 `video=WebRTC live` / `video=demo.mp4 fallback`
   으로 현재 상태를 명시.
+- 오른쪽 컨트롤러 `B` 버튼은 HUD 의 `ready` / `E-STOP LATCHED` 상태를 토글한다.
+  따라서 ready 조작을 위해 커서를 맞출 필요는 없다.
+- head camera plane 이나 아래 HUD/dashboard 를 trigger 로 잡고 움직이면 두 패널이
+  하나의 창처럼 같이 이동한다. 이 UI 조작 중 trigger 값은 pose payload 에서는
+  `0.0` 으로 보내 gripper close 명령과 겹치지 않게 한다. 조준 디버깅이 필요할 때만
+  `?show_cursor=1` 을 붙이면 controller ray/cursor 를 볼 수 있다.
 
-### 3. Home Server (M8 전): 가짜 producer 로 loopback
+컨트롤러가 없는 개발/시연 환경에서 sim 경로만 확인하려면 명시적으로 dev mode 를 켠다:
 
-Home Server 측 WebRTC 통합(M8) 전에 미디어 경로를 단독 검증하려면 같은 Mac
-에서 `fake_producer.py` 를 한 번 더 띄운다:
+```text
+https://<mac-lan-ip>:8443/?robot=0&dev_no_controller=1
+```
+
+이 모드는 HMD 앞쪽에 synthetic right-hand pose 를 만들고 `right.grip=1.0` 을 계속 보내
+clutch-on 상태를 흉내낸다. 실제 로봇에는 쓰지 말고 sim/demo 검증용으로만 사용.
+
+### 3. 비디오 소스 — 세 가지 중 하나 선택
+
+**(a) 가짜 demo.mp4 loop** (네트워크/Tailscale 미연결 검증용):
 
 ```bash
 python3 tools/fake_producer.py \
@@ -83,13 +140,26 @@ python3 tools/fake_producer.py \
     --source tools/webxr/assets/demo.mp4
 ```
 
-→ Quest 페이지의 video plane 이 `WebRTC live` 로 바뀌면서 같은 demo.mp4 가 흐른다
-(파일 fallback 과 WebRTC 라이브가 시각적으로 같으므로, HUD 의 status 라인으로 구분).
+**(b) 진짜 indoory_isaac_sim 의 head camera** (현재 권장 — sim 이 살아있으면 바로 보임):
 
-### 4. Home Server (M8 이후): 진짜 NVENC producer
+```bash
+# 먼저 sim 살아있는지 검증
+python3 tools/sim_probe.py 100.80.87.68
 
-같은 `/signaling/server` 엔드포인트에 Home Server 의 NVENC encoder 가 offer 를
-보내면 끝. 페이지는 새로고침 없이 자동으로 트랙이 갈아끼워진다 (`replaceTrack` on sender).
+# 살아있으면 rgb.front.<robot_id> 를 받아 WebRTC 트랙으로 publish
+python3 tools/sim_video_bridge.py \
+    --sim-host 100.80.87.68 --robot-id 0 --topic rgb.front
+```
+
+스펙 §4.2.3 그대로 — JPEG (10Hz) → cv2.imdecode (BGR) → av.VideoFrame(bgr24) →
+VideoStreamTrack. sim 이 일시적으로 다운돼서 JPEG 가 끊겨도 트랙은 죽지 않고
+'waiting for sim head camera...' 검은 프레임으로 fallback (페이지는 그대로 유지).
+
+**(c) Home Server NVENC encoder** (M8):
+
+같은 `/signaling/server` 엔드포인트에 Home Server 가 직접 NVENC offer 를 보내면 끝.
+페이지/Mac proxy 양쪽 모두 새로고침 없이 자동으로 트랙이 swap (selective forwarder
+의 `replaceTrack` 동작).
 
 ## VR bridge 가 받는 ZMQ 페이로드 (§4.2 ZMQ PUB)
 
@@ -102,14 +172,15 @@ import zmq, msgpack
 ctx = zmq.Context()
 sub = ctx.socket(zmq.SUB)
 sub.connect("tcp://<mac-tailscale-ip>:7001")
-sub.setsockopt(zmq.SUBSCRIBE, b"pose.2")          # robot_id=2 만
+sub.setsockopt(zmq.SUBSCRIBE, b"pose.0")          # default single robot path
 while True:
     topic, body = sub.recv_multipart()
     pose = msgpack.unpackb(body, raw=False)
     # pose: {
     #   "schema":    "xlerobot_v1.1.page",
     #   "stamp_ns":  <mac mono ns>,
-    #   "robot_id":  2,
+    #   "robot_id":  0,
+    #   "frame":     "local-floor",
     #   "t_page_ms": <page perf.now() ms>,
     #   "hmd":   [x,y,z, qx,qy,qz,qw],            # local-floor frame (RH)
     #   "left":  {"pose":[...] | None, "grip":f, "trigger":f, "buttons":{...}},
@@ -121,13 +192,32 @@ while True:
 bridge 는 `R_robot_from_xr` (§4.4) 적용 후 anchor/twist-swing/clamp 처리 → sim 으로 PUSH.
 Page payload 는 의도적으로 robot 좌표계로 변환되어 있지 않다 — 그 변환은 bridge 책임.
 
+Home Server 에서는 별도의 VR bridge 프로세스가 반드시 떠 있어야 한다. sim 이
+`--vr-mode` 로 떠 있어도 bridge 가 `pose.0`을 SUB하지 않으면 로봇팔 command는 생성되지 않는다.
+
+```bash
+# Home Server 쪽, examples/vr_teleop_bridge.py 가 있는 repo에서 실행
+python examples/vr_teleop_bridge.py \
+  --host 127.0.0.1 \
+  --source zmq \
+  --pose-host <MAC_IP_OR_TAILSCALE_IP> \
+  --pose-port 7001 \
+  --robot-id 0 \
+  -v
+```
+
+정상 동작의 최소 조건은 `topic=b"pose.0"`, `robot_id=0`, `estop=false`,
+`right.pose != null`, `right.grip > 0.5` 이다. bridge 는 `right.grip` 첫 engaged
+tick 에서 anchor 를 잡고, 이후 right controller delta 를 robot base frame 으로 변환해
+sim `:5556` PULL 로 `arm_ee_pose_target.right` 를 보낸다.
+
 ## M3 통과 기준 (계획서 §8 row "3")
 
 | # | 검증 항목 | 확인 방법 |
 |---|---|---|
 | (a) | Mac proxy 가 양 인터페이스 host candidate publish | `mac_proxy.py` 기동 로그에 en0 + utun 둘 다 enumerate. `fake_producer.py` 가 동일 호스트에서 붙고 connection state 가 `connected` |
 | (b) | mac ↔ server end-to-end <10ms (가짜 producer) | `fake_producer.py` 가 mac_proxy 와 localhost 통신 시 트랙 도착까지 1초 미만, RTP 흐름 안정 |
-| (c) | `?robot=N` 라우팅 | Quest 페이지에서 `?robot=2` 로 접속 후 mac_proxy 로그에 `pose ws[xxx] robot_id 1 -> 2`. `zmq` SUB 로 `b"pose.2"` 토픽 확인 |
+| (c) | `?robot=N` 라우팅 | Quest 페이지에서 `?robot=2` 로 접속 후 mac_proxy 로그에 `pose ws[xxx] robot_id 0 -> 2`. `zmq` SUB 로 `b"pose.2"` 토픽 확인 |
 | (d) | pose ZMQ PUB 90Hz | 별도 sub 클라이언트로 토픽 SUB 시 5초 평균 ~90Hz |
 
 ## M0b 통과 기준 (§8 row "0b")
@@ -137,9 +227,9 @@ WebRTC 안 붙으면 demo.mp4 가 fallback 으로 흐른다.)
 
 | # | 검증 항목 | 확인 방법 |
 |---|---|---|
-| (i)   | immersive-vr 세션 진입 | Enter VR → 헤드셋이 grid + video plane 보임 |
+| (i)   | immersive-ar 세션 진입 | Enter AR → 실제 주변 passthrough 위에 video plane 보임 |
 | (ii)  | `<video>` 동시 렌더링 | video plane 에 SMPTE bars + 타임코드가 끊김 없이 흐름 |
-| (iii) | B/Y/A/X 가 page JS 에 도달 | HUD 의 버튼 row 점등. B → 빨간 E-STOP. thumb click 으로 해제 |
+| (iii) | B/Y/A/X 가 page JS 에 도달 | HUD 의 버튼 row 점등. 오른쪽 B → ready / E-STOP 토글. Y → 빨간 E-STOP |
 
 ## 페이지 → mac → bridge wire 흐름 (한 장)
 
@@ -150,12 +240,18 @@ WebRTC 안 붙으면 demo.mp4 가 fallback 으로 흐른다.)
 
 | 입력 | Gamepad index | 동작 |
 |---|---|---|
-| Trigger | `buttons[0]` 아날로그 | gripper close (`right.trigger` / `left.trigger`) |
+| Trigger | `buttons[0]` 아날로그 | gripper close (`right.trigger` / `left.trigger`). WebXR panel 을 가리킨 상태에서 누르면 UI drag 로 사용하고 payload trigger 는 `0.0` 으로 억제 |
 | Grip    | `buttons[1]` 아날로그 | clutch hold (right/left 독립) |
 | A (R) / X (L) | `buttons[4]` digital | anchor 강제 리셋 |
-| B (R) / Y (L) | `buttons[5]` digital | **E-STOP latched** |
-| Thumbstick click | `buttons[3]` digital | M0b 단계 e-stop release fallback (§8 비고) |
-| Menu (system) | OS 가로챔 | page JS 에 안 도달 |
+| B (R) | `buttons[5]` digital | `ready` / **E-STOP LATCHED** 토글 |
+| Y (L) | `buttons[5]` digital | **E-STOP latched** |
+| Menu (system) | `buttons[6]` if exposed | 계획서 목표: 1초 long-press 로 **E-STOP release** |
+| Thumbstick click | `buttons[3]` digital | 현재 구현: M0b/M4 dev fallback release. 별도 `estop_release` edge 필드는 보내지 않음 |
+
+현재 구현은 top-level `estop` latch 만 wire payload에 싣는다. 오른쪽 B는
+`estop=true/false` 를 토글하고, 왼쪽 Y는 `estop=true` 로 latch 한다. menu long-press가
+실제 런타임에서 노출되거나 thumbstick dev fallback을 누르면 `estop=false`로 복귀한다.
+bridge는 이 false 복귀를 release로 해석해야 한다.
 
 ## 송출 WebSocket 페이로드 (§4.1 schema)
 
@@ -189,7 +285,8 @@ WebRTC 안 붙으면 demo.mp4 가 fallback 으로 흐른다.)
 ## 운영 환경(§10) 전환 체크리스트
 
 - 인증서: 자기서명 → Caddy + Let's Encrypt DNS-01. mac_proxy 는 `--port 8443` 을
-  localhost-bind 로 바꾼 뒤 Caddy reverse proxy 받는 형태로 변경.
+  localhost-bind 로 바꾼 뒤 Caddy reverse proxy 받는 형태로 변경. 자세한 경로는
+  [`docs/production_tls.md`](./docs/production_tls.md).
 - ZMQ PUB bind: `0.0.0.0` → Tailscale 인터페이스 IP 로 명시 (`tcp://100.x.y.z:7001`).
 - 방화벽: Mac 의 8443/8444 인바운드는 LAN, 7001 인바운드는 Tailnet 만 허용.
 - WebRTC ICE: STUN 추가 (`--stun stun:stun.l.google.com:19302`) 가 필요한지 §6.2
@@ -198,7 +295,9 @@ WebRTC 안 붙으면 demo.mp4 가 fallback 으로 흐른다.)
 ## 디버깅 팁
 
 - 인터페이스 점검: `python3 tools/mac_proxy.py --log-level DEBUG` → 기동 시 ipv4 enumerate 출력.
-- ICE candidate 보기: Quest Chrome inspect 의 `chrome://webrtc-internals` 또는 mac_proxy 의 `aioice` 로그 레벨 INFO 로 상승.
+- ICE candidate 보기: `python3 tools/ice_probe.py` 로 LAN/Tailscale host candidate 확인.
+  Tailscale이 없는 개발 환경에서 도구 자체만 확인하려면
+  `python3 tools/ice_probe.py --allow-missing-tailscale`.
 - pose 토픽 sniff: `python3 -c "import zmq,msgpack;c=zmq.Context();s=c.socket(zmq.SUB);s.connect('tcp://localhost:7001');s.setsockopt(zmq.SUBSCRIBE,b'');import sys;t,b=s.recv_multipart();print(t,msgpack.unpackb(b))"`
 - 영상 codec: `ffprobe tools/webxr/assets/demo.mp4` — H.264 baseline 3.1 yuv420p.
 - WebXR profile/버튼 매핑 검증: `https://immersive-web.github.io/webxr-samples/input-profiles.html` 같은 페이지를 Quest Browser 에서 별도로 띄워 확인.

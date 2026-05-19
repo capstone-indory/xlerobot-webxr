@@ -266,6 +266,7 @@ class ZMQPosePublisher:
             "schema": "xlerobot_v1.1.page",   # bridge 가 v1.1 변환할 입력 표시
             "stamp_ns": time.monotonic_ns(),
             "robot_id": robot_id,
+            "frame": payload.get("frame", "local-floor"),
             "t_page_ms": payload.get("t"),
             "hmd": payload.get("hmd"),
             "left": payload.get("left"),
@@ -282,7 +283,7 @@ class ZMQPosePublisher:
 # Pose WebSocket — page → mac → ZMQ
 # ===========================================================================
 
-DEFAULT_ROBOT_ID = 1
+DEFAULT_ROBOT_ID = 0
 
 
 class PoseWSHandler:
@@ -308,6 +309,8 @@ class PoseWSHandler:
             robot_id = int(request.query.get("robot", DEFAULT_ROBOT_ID))
         except ValueError:
             robot_id = DEFAULT_ROBOT_ID
+        if robot_id < 0:
+            robot_id = DEFAULT_ROBOT_ID
         log.info("pose ws[%s] connect from %s, robot_id=%d (initial)", client_id, peer, robot_id)
 
         last_log_t = 0.0
@@ -326,6 +329,8 @@ class PoseWSHandler:
                         try:
                             new_id = int(payload["select_robot"])
                         except (TypeError, ValueError):
+                            continue
+                        if new_id < 0:
                             continue
                         if new_id != robot_id:
                             log.info("pose ws[%s] robot_id %d -> %d", client_id, robot_id, new_id)
@@ -447,6 +452,12 @@ def _build_pc(stun_urls: list) -> RTCPeerConnection:
     return RTCPeerConnection(configuration=cfg)
 
 
+def _sdp_candidate_count(sdp: Optional[str]) -> int:
+    if not sdp:
+        return 0
+    return sum(1 for line in sdp.splitlines() if line.startswith("a=candidate:"))
+
+
 async def _await_ice_complete(pc: RTCPeerConnection, timeout_s: float = 3.0) -> None:
     """ICE gathering 완료를 기다린다. 타임아웃 후엔 갖고 있는 후보만으로 진행."""
     if pc.iceGatheringState == "complete":
@@ -461,8 +472,13 @@ async def _await_ice_complete(pc: RTCPeerConnection, timeout_s: float = 3.0) -> 
     try:
         await asyncio.wait_for(done.wait(), timeout=timeout_s)
     except asyncio.TimeoutError:
-        log.warning("ICE gathering timeout (%.1fs) — proceeding with %d candidates",
-                    timeout_s, pc.iceGatheringState)
+        candidate_count = _sdp_candidate_count(
+            pc.localDescription.sdp if pc.localDescription else None
+        )
+        log.warning(
+            "ICE gathering timeout (%.1fs) — state=%s candidates=%d",
+            timeout_s, pc.iceGatheringState, candidate_count,
+        )
 
 
 def _parse_candidate_message(data: dict):
@@ -619,10 +635,41 @@ def make_page_app(webroot: pathlib.Path, pose_handler: PoseWSHandler) -> web.App
     return app
 
 
+async def _signaling_index(request: web.Request) -> web.Response:
+    """`:8444` root 에 stub HTML 을 둔다.
+
+    이유: Quest Browser 의 cert 예외는 origin(host:port) 단위라서, 페이지가
+    :8443 에서 동작하는 데 cert 가 accept 됐어도 :8444 의 WSS 는 별도 origin
+    이라 따로 accept 해야 한다. WebSocket 핸드셰이크 자체는 cert 경고 UI 를
+    띄우지 못해서, 사용자가 미리 https://<host>:8444/ 를 방문해 cert 예외를
+    처리해 둬야 시그널링이 붙는다. 이 stub 이 그 방문 페이지.
+    """
+    return web.Response(
+        text=(
+            "<!doctype html><meta charset='utf-8'>"
+            "<title>xlerobot-webxr signaling :8444</title>"
+            "<style>body{font-family:system-ui,sans-serif;padding:32px;max-width:520px;"
+            "background:#0a0e14;color:#e6e6e6;line-height:1.6}"
+            "code{background:#1e293b;padding:2px 6px;border-radius:4px}"
+            "h1{color:#67e8f9}</style>"
+            "<h1>xlerobot-webxr · signaling endpoint</h1>"
+            "<p>이 페이지가 보이면 <code>:8444</code> 의 자기서명 cert 가 정상적으로 "
+            "이 브라우저에 등록되었습니다. <strong>이 탭은 닫고</strong> 메인 페이지 "
+            "<code>https://&lt;host&gt;:8443/</code> 으로 돌아가 WebXR 텔레옵을 시작하세요.</p>"
+            "<p style='color:#94a3b8'>이 포트는 WSS 시그널링(<code>/signaling/quest</code>, "
+            "<code>/signaling/server</code>)만 서빙합니다. WebSocket 핸드셰이크 자체는 "
+            "cert 경고 UI 를 띄울 수 없어서, 처음 1회 이 root 페이지를 방문해 cert 예외를 "
+            "걸어두는 단계가 필요합니다 — 이 페이지의 유일한 존재 이유입니다.</p>"
+        ),
+        content_type="text/html",
+    )
+
+
 def make_signaling_app(hub: MediaHub, stun_urls: list) -> web.Application:
     app = web.Application()
     q = QuestSignalingHandler(hub, stun_urls)
     s = ServerSignalingHandler(hub, stun_urls)
+    app.router.add_get("/", _signaling_index)
     app.router.add_get("/signaling/quest", q.handle)
     app.router.add_get("/signaling/server", s.handle)
     return app
@@ -665,7 +712,9 @@ async def _run(cfg: Config) -> None:
     log.info("  Quest 3 에서 접속할 URL  (LAN — Wi-Fi 같은 공유기)")
     if lan_ips:
         for ip in lan_ips:
-            log.info("    →  https://%s:%d/?robot=1", ip, cfg.port)
+            log.info("    1) https://%s:%d/   ← cert 예외 1회 수락 (signaling 포트)",
+                     ip, cfg.signal_port)
+            log.info("    2) https://%s:%d/?robot=0   ← 메인 페이지", ip, cfg.port)
     else:
         log.info("    →  (LAN IP 미감지 — Wi-Fi/이더넷 연결 확인 필요)")
     log.info("")
