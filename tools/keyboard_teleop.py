@@ -41,6 +41,14 @@ TF_TARGET_NAMES = {"right": "gripper_right", "left": "gripper_left"}
 ARM_SIDES = ("right", "left")
 DEFAULT_SIM_HOST = "100.80.87.68"
 DEFAULT_ROBOT_ID = 0
+DEFAULT_STEP_M = 0.050
+DEFAULT_SPEED_MPS = 0.240
+DEFAULT_MAX_OFFSET_M = 0.300
+EE_REACH_RADIUS_M = 0.56
+ARM_MOUNT_OFFSET = {
+    "right": (-0.135, -0.133, 0.760),
+    "left": (-0.135, +0.133, 0.760),
+}
 
 
 HTML = r"""<!doctype html>
@@ -152,11 +160,13 @@ HTML = r"""<!doctype html>
 const query = new URLSearchParams(location.search);
 const robotId = Number.parseInt(query.get("robot") || "0", 10);
 const sendHz = Number.parseFloat(query.get("hz") || "60");
-const stepM = Number.parseFloat(query.get("step") || "0.030");
-const maxOffset = Number.parseFloat(query.get("max_offset") || "0.120");
+const stepM = Number.parseFloat(query.get("step") || "0.050");
+const speedMps = Number.parseFloat(query.get("speed") || "0.240");
+const maxOffset = Number.parseFloat(query.get("max_offset") || "0.300");
 const panStep = Number.parseFloat(query.get("pan_step") || "0.050");
 const gripStep = Number.parseFloat(query.get("grip_step") || "0.010");
 const maxPan = Number.parseFloat(query.get("max_pan") || "0.700");
+const motionKeys = new Set(["KeyW", "KeyS", "KeyR", "KeyF"]);
 const pressed = new Set();
 const queuedNudge = [0, 0, 0];
 const targetOffset = [0, 0, 0];
@@ -221,6 +231,22 @@ function moveStep() {
   const gain = (pressed.has("ShiftLeft") || pressed.has("ShiftRight")) ? 2.5 : 1.0;
   return stepM * gain;
 }
+function moveSpeed() {
+  const gain = (pressed.has("ShiftLeft") || pressed.has("ShiftRight")) ? 3.0 : 1.0;
+  return speedMps * gain;
+}
+function applyNudgeVector(next) {
+  const applied = [0, 0, 0];
+  if (next.some(v => v !== 0)) {
+    for (let i = 0; i < 3; i += 1) {
+      const before = targetOffset[i];
+      targetOffset[i] = clamp(before + next[i], -maxOffset, maxOffset);
+      applied[i] = targetOffset[i] - before;
+    }
+    active = true;
+  }
+  return applied;
+}
 function queueNudge(code) {
   const move = moveStep();
   const next = [0, 0, 0];
@@ -228,14 +254,21 @@ function queueNudge(code) {
   if (code === "KeyS") next[2] = -move;
   if (code === "KeyR") next[0] = +move;
   if (code === "KeyF") next[0] = -move;
-  if (next.some(v => v !== 0)) {
-    for (let i = 0; i < 3; i += 1) {
-      queuedNudge[i] += next[i];
-      targetOffset[i] = clamp(targetOffset[i] + next[i], -maxOffset, maxOffset);
-    }
-    active = true;
+  const applied = applyNudgeVector(next);
+  if (applied.some(v => v !== 0)) {
+    for (let i = 0; i < 3; i += 1) queuedNudge[i] += applied[i];
     lastInput = code;
   }
+}
+function heldNudge(dt) {
+  if (dt <= 0) return [0, 0, 0];
+  const move = moveSpeed() * dt;
+  const next = [0, 0, 0];
+  if (pressed.has("KeyW")) next[2] += move;
+  if (pressed.has("KeyS")) next[2] -= move;
+  if (pressed.has("KeyR")) next[0] += move;
+  if (pressed.has("KeyF")) next[0] -= move;
+  return applyNudgeVector(next);
 }
 function tapInput(code) {
   if (code === "Space") {
@@ -269,9 +302,11 @@ function gripperDelta() {
   if (pressed.has("KeyX")) delta += gripStep;
   return delta;
 }
-function sendCommand() {
+function sendCommand(dt = 0) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const nudge = queuedNudge.slice();
+  const held = heldNudge(dt);
+  for (let i = 0; i < 3; i += 1) nudge[i] += held[i];
   lastNudge = nudge.slice();
   queuedNudge[0] = 0; queuedNudge[1] = 0; queuedNudge[2] = 0;
   ws.send(JSON.stringify({
@@ -305,7 +340,7 @@ function render() {
 function loop(now) {
   const dt = Math.min(0.05, Math.max(0.001, (now - lastTick) / 1000));
   lastTick = now;
-  sendCommand();
+  sendCommand(dt);
   render();
   setTimeout(() => requestAnimationFrame(loop), 1000 / sendHz);
 }
@@ -330,8 +365,12 @@ window.addEventListener("keydown", (e) => {
     targetOffset[0] = 0; targetOffset[1] = 0; targetOffset[2] = 0;
     pressed.add(code);
     lastInput = code;
+  } else if (motionKeys.has(code)) {
+    if (!pressed.has(code) && !e.repeat) queueNudge(code);
+    pressed.add(code);
+    active = true;
+    lastInput = code || lastInput;
   } else {
-    queueNudge(code);
     pressed.add(code);
     active = true;
     lastInput = code || lastInput;
@@ -364,18 +403,18 @@ for (const code of ["KeyW","KeyA","KeyS","KeyD","KeyR","KeyF","KeyZ","KeyX","Dig
       targetOffset[0] = 0; targetOffset[1] = 0; targetOffset[2] = 0;
     } else {
       pressed.add(code);
-      queueNudge(code);
+      if (motionKeys.has(code)) queueNudge(code);
     }
     active = code === "Space" ? active : true;
     lastInput = code;
-    sendCommand();
+    sendCommand(0);
     render();
   };
   const up = (e) => {
     e.preventDefault();
     pressed.delete(code);
     if (!pressed.size) lastInput = "idle";
-    sendCommand();
+    sendCommand(0);
     render();
   };
   el.addEventListener("pointerdown", down);
@@ -386,7 +425,7 @@ for (const code of ["KeyW","KeyA","KeyS","KeyD","KeyR","KeyF","KeyZ","KeyX","Dig
     e.preventDefault();
     if (performance.now() - pointerStarted < 250) return;
     const transient = tapInput(code);
-    sendCommand();
+    sendCommand(0);
     if (transient) pressed.delete(code);
     render();
   });
@@ -616,6 +655,12 @@ class DirectSimTeleop:
             pose[3:7] = current[3:7]
         for idx, delta in enumerate(deltas):
             pose[idx] += float(delta)
+        pose = _clamp_pose_to_workspace(side, pose)
+        anchor = self.anchor_ee.get(side)
+        if isinstance(anchor, list) and len(anchor) >= 3:
+            self.target_offsets[side] = [
+                float(pose[idx]) - float(anchor[idx]) for idx in range(3)
+            ]
         return pose
 
     def _hold_targets(self) -> dict[str, list[float]]:
@@ -793,6 +838,19 @@ def _vec3(value: Any) -> list[float]:
     return out
 
 
+def _clamp_pose_to_workspace(side: str, pose: list[float]) -> list[float]:
+    mount = ARM_MOUNT_OFFSET[side]
+    delta = [float(pose[i]) - mount[i] for i in range(3)]
+    radius = math.sqrt(sum(v * v for v in delta))
+    if radius <= EE_REACH_RADIUS_M or radius <= 1e-9:
+        return pose
+    scale = EE_REACH_RADIUS_M / radius
+    clamped = list(pose)
+    for idx in range(3):
+        clamped[idx] = mount[idx] + delta[idx] * scale
+    return clamped
+
+
 async def index(request: web.Request) -> web.Response:
     return web.Response(text=HTML, content_type="text/html")
 
@@ -852,7 +910,7 @@ async def api_nudge(request: web.Request) -> web.Response:
     code = str(data.get("code") or request.query.get("code") or "")
     frames = int(float(data.get("frames") or request.query.get("frames") or 5))
     hz = float(data.get("hz") or request.query.get("hz") or 60.0)
-    step_m = float(data.get("step") or request.query.get("step") or 0.030)
+    step_m = float(data.get("step") or request.query.get("step") or DEFAULT_STEP_M)
     pan_step = float(data.get("pan_step") or request.query.get("pan_step") or 0.050)
     grip_step = float(data.get("grip_step") or request.query.get("grip_step") or 0.010)
     frames = max(1, min(frames, 30))
@@ -958,7 +1016,7 @@ def main() -> int:
     parser.add_argument(
         "--max-offset",
         type=float,
-        default=0.12,
+        default=DEFAULT_MAX_OFFSET_M,
         help="Clamp accumulated EE target offset to +/- this many meters per axis.",
     )
     parser.add_argument(

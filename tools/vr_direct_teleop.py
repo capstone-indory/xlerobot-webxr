@@ -444,7 +444,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-id", type=int, default=0)
     parser.add_argument("--side", choices=["right", "left", "both"], default="right")
     parser.add_argument("--rate-hz", type=float, default=60.0)
-    parser.add_argument("--position-scale", type=float, default=0.5)
+    parser.add_argument("--position-scale", type=float, default=1.0)
     parser.add_argument("--grip-threshold", type=float, default=0.5)
     parser.add_argument("--gripper-per-tick", type=float, default=0.01)
     parser.add_argument("--stale-ms", type=float, default=150.0)
