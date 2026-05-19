@@ -9,6 +9,12 @@ XLerobot WebXR 스택 전체를 한 명령으로 띄우는 launcher.
        (또는 --video-source fake → fake_producer.py demo.mp4 loop)
        (또는 --video-source none → 영상 없이 텔레옵 wire 만)
 
+`--keyboard-teleop` 모드는 위 VR/WebRTC 스택을 띄우지 않고
+tools/keyboard_teleop.py 만 실행한다.
+
+`--vr-direct-teleop` 모드는 mac_proxy/WebXR 페이지를 띄운 뒤 pose.<robot_id>
+ZMQ stream 을 tools/vr_direct_teleop.py 로 받아 sim arm 으로 직접 보낸다.
+
 설계 결정:
   • 각 컴포넌트는 자기완비 스크립트로 유지 (단독 실행 + 테스트 모두 가능).
   • launcher 는 그 위에 얇은 orchestrator — subprocess 로 띄우고, 로그 합치고,
@@ -22,6 +28,8 @@ XLerobot WebXR 스택 전체를 한 명령으로 띄우는 launcher.
   python3 tools/run.py --sim-host 100.80.87.68 --sim-topic rgb.wrist
   python3 tools/run.py --video-source fake       # sim 미연결 시 demo.mp4 loop
   python3 tools/run.py --video-source none       # 영상 없이 mac_proxy 만
+  python3 tools/run.py --keyboard-teleop         # Quest 없이 브라우저 키보드 → sim arm
+  python3 tools/run.py --vr-direct-teleop        # Quest WebXR pose → sim arm 직접
 """
 
 from __future__ import annotations
@@ -39,6 +47,8 @@ ROOT = pathlib.Path(__file__).resolve().parent
 PROXY = ROOT / "mac_proxy.py"
 BRIDGE = ROOT / "sim_video_bridge.py"
 FAKE = ROOT / "fake_producer.py"
+KEYBOARD = ROOT / "keyboard_teleop.py"
+VR_DIRECT = ROOT / "vr_direct_teleop.py"
 DEMO_MP4 = ROOT / "webxr" / "assets" / "demo.mp4"
 
 log = logging.getLogger("run")
@@ -183,21 +193,63 @@ def _fake_producer_spec(args: argparse.Namespace) -> ChildSpec:
     )
 
 
+def _keyboard_teleop_spec(args: argparse.Namespace) -> ChildSpec:
+    argv = [
+        sys.executable, str(KEYBOARD),
+        "--host", args.keyboard_host,
+        "--port", str(args.keyboard_port),
+        "--sim-host", args.sim_host,
+        "--sim-pub-port", str(args.sim_port),
+        "--sim-pull-port", str(args.sim_pull_port),
+        "--robot-id", str(args.sim_robot_id),
+        "--side", args.keyboard_side,
+        "--log-level", args.log_level,
+    ]
+    return ChildSpec(label="keybd ", argv=argv)
+
+
+def _vr_direct_teleop_spec(args: argparse.Namespace) -> ChildSpec:
+    argv = [
+        sys.executable, str(VR_DIRECT),
+        "--source", "zmq",
+        "--pose-host", args.pose_host,
+        "--pose-port", str(args.pose_port),
+        "--sim-host", args.sim_host,
+        "--sim-pub-port", str(args.sim_port),
+        "--sim-pull-port", str(args.sim_pull_port),
+        "--robot-id", str(args.sim_robot_id),
+        "--side", args.vr_side,
+        "--position-scale", str(args.vr_position_scale),
+        "--grip-threshold", str(args.vr_grip_threshold),
+        "--log-level", args.log_level,
+    ]
+    return ChildSpec(
+        label="vrarm ",
+        argv=argv,
+        start_after_port=("127.0.0.1", args.port),
+    )
+
+
 # ===========================================================================
 # Top level
 # ===========================================================================
 
 async def run(args: argparse.Namespace) -> int:
-    specs: List[ChildSpec] = [_proxy_spec(args)]
-    if args.video_source == "sim":
-        specs.append(_sim_bridge_spec(args))
-    elif args.video_source == "fake":
-        specs.append(_fake_producer_spec(args))
-    elif args.video_source == "none":
-        pass
+    if args.keyboard_teleop:
+        specs: List[ChildSpec] = [_keyboard_teleop_spec(args)]
     else:
-        log.error("unknown video-source: %s", args.video_source)
-        return 2
+        specs = [_proxy_spec(args)]
+        if args.video_source == "sim":
+            specs.append(_sim_bridge_spec(args))
+        elif args.video_source == "fake":
+            specs.append(_fake_producer_spec(args))
+        elif args.video_source == "none":
+            pass
+        else:
+            log.error("unknown video-source: %s", args.video_source)
+            return 2
+        if args.vr_direct_teleop:
+            specs.append(_vr_direct_teleop_spec(args))
 
     # spawn all (start_after_port 가 있는 자식은 그 포트 LISTEN 후 spawn)
     children: List[Child] = []
@@ -255,8 +307,18 @@ async def run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="XLerobot WebXR 전체 스택 (mac_proxy + 비디오 publisher) 한 번에",
+        description="XLerobot WebXR 전체 스택 또는 non-VR keyboard teleop launcher",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--keyboard-teleop",
+        action="store_true",
+        help="VR/WebRTC stack 대신 tools/keyboard_teleop.py만 실행",
+    )
+    p.add_argument(
+        "--vr-direct-teleop",
+        action="store_true",
+        help="mac_proxy pose.<robot_id> stream 을 sim arm target 으로 직접 변환",
     )
     # ── 영상 소스 선택 ───────────────────────────────────────────────────
     p.add_argument(
@@ -279,10 +341,23 @@ def main() -> int:
     g_sim = p.add_argument_group("sim_video_bridge (video-source=sim)")
     g_sim.add_argument("--sim-host", default="100.80.87.68")
     g_sim.add_argument("--sim-port", type=int, default=5555)
+    g_sim.add_argument("--sim-pull-port", type=int, default=5556)
     g_sim.add_argument("--sim-robot-id", type=int, default=0)
     g_sim.add_argument("--sim-topic", default="rgb.front",
                        help="rgb.front | rgb.wrist")
     g_sim.add_argument("--video-fps", type=int, default=30)
+    # ── non-VR keyboard teleop 인자 ─────────────────────────────────────
+    g_keyboard = p.add_argument_group("keyboard_teleop (--keyboard-teleop)")
+    g_keyboard.add_argument("--keyboard-host", default="127.0.0.1")
+    g_keyboard.add_argument("--keyboard-port", type=int, default=8765)
+    g_keyboard.add_argument("--keyboard-side", choices=["right", "left"], default="right")
+    # ── direct VR arm bridge 인자 ────────────────────────────────────────
+    g_vr = p.add_argument_group("vr_direct_teleop (--vr-direct-teleop)")
+    g_vr.add_argument("--pose-host", default="127.0.0.1")
+    g_vr.add_argument("--pose-port", type=int, default=7001)
+    g_vr.add_argument("--vr-side", choices=["right", "left", "both"], default="right")
+    g_vr.add_argument("--vr-position-scale", type=float, default=0.5)
+    g_vr.add_argument("--vr-grip-threshold", type=float, default=0.5)
     # ── 공통 ───────────────────────────────────────────────────────────
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args()
