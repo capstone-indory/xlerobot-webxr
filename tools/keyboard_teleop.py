@@ -28,27 +28,27 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import msgpack
 import zmq
 import zmq.asyncio
 from aiohttp import WSMsgType, web
 
+from teleop_common import (
+    ARM_SIDES,
+    DEFAULT_SIM_HOST,
+    build_command_payload,
+    clamp_pose_to_workspace,
+    extract_tf_poses,
+    pack_command,
+    unpack_payload,
+)
+
 
 log = logging.getLogger("keyboard_teleop")
 
-SCHEMA_VERSION_V11 = "xlerobot_v1.1"
-TF_TARGET_NAMES = {"right": "gripper_right", "left": "gripper_left"}
-ARM_SIDES = ("right", "left")
-DEFAULT_SIM_HOST = "100.80.87.68"
 DEFAULT_ROBOT_ID = 0
 DEFAULT_STEP_M = 0.050
 DEFAULT_SPEED_MPS = 0.240
 DEFAULT_MAX_OFFSET_M = 0.300
-EE_REACH_RADIUS_M = 0.56
-ARM_MOUNT_OFFSET = {
-    "right": (-0.135, -0.133, 0.760),
-    "left": (-0.135, +0.133, 0.760),
-}
 
 
 HTML = r"""<!doctype html>
@@ -541,18 +541,10 @@ class DirectSimTeleop:
         while True:
             topic, payload = await self.sub.recv_multipart()
             try:
-                msg = msgpack.unpackb(payload, raw=False)
+                msg = unpack_payload(payload)
             except Exception:
                 continue
-            updates: dict[str, list[float]] = {}
-            for entry in msg.get("targets", []) or []:
-                name = entry.get("name")
-                pose = entry.get("pose")
-                if not isinstance(pose, (list, tuple)) or len(pose) != 7:
-                    continue
-                for side, target_name in TF_TARGET_NAMES.items():
-                    if name == target_name:
-                        updates[side] = [float(v) for v in pose]
+            updates = extract_tf_poses(msg)
             if not updates:
                 continue
             self.latest_ee.update(updates)
@@ -655,7 +647,7 @@ class DirectSimTeleop:
             pose[3:7] = current[3:7]
         for idx, delta in enumerate(deltas):
             pose[idx] += float(delta)
-        pose = _clamp_pose_to_workspace(side, pose)
+        pose = clamp_pose_to_workspace(side, pose)
         anchor = self.anchor_ee.get(side)
         if isinstance(anchor, list) and len(anchor) >= 3:
             self.target_offsets[side] = [
@@ -689,63 +681,37 @@ class DirectSimTeleop:
     ) -> None:
         if self.push is None:
             return
-        payload = {
-            "schema": SCHEMA_VERSION_V11,
-            "stamp_ns": time.monotonic_ns(),
-            "robot_id": self.cfg.robot_id,
-            "frame": "body",
-            "base_cmd_vel": [0.0, 0.0, 0.0],
-            "arm_ee_pose_target": {
-                side: {"pose": pose, "mode": "absolute", "frame": "base"}
-                for side, pose in targets_by_side.items()
-            },
-            "arm_joint_relative_target": rel,
-            "head_joint_relative_target": {"head_pan": 0.0, "head_tilt": 0.0},
-        }
-        await self.push.send(msgpack.packb(payload, use_bin_type=True))
+        payload = build_command_payload(self.cfg.robot_id, targets_by_side, rel)
+        await self.push.send(pack_command(payload))
         self.last_send_ns = payload["stamp_ns"]
 
     async def _send_pose_hold(self, sides: tuple[str, ...]) -> None:
         if self.push is None:
             return
-        targets: dict[str, dict[str, Any]] = {}
+        targets: dict[str, list[float]] = {}
         rel: dict[str, dict[str, float]] = {}
         for side in sides:
             pose = self._hold_pose(side)
             if pose is None:
                 continue
-            targets[side] = {"pose": pose, "mode": "absolute", "frame": "base"}
+            targets[side] = pose
             rel[side] = {"shoulder_pan": 0.0, "gripper": 0.0}
         if not targets:
             return
-        payload = {
-            "schema": SCHEMA_VERSION_V11,
-            "stamp_ns": time.monotonic_ns(),
-            "robot_id": self.cfg.robot_id,
-            "frame": "body",
-            "base_cmd_vel": [0.0, 0.0, 0.0],
-            "arm_ee_pose_target": targets,
-            "arm_joint_relative_target": rel,
-            "head_joint_relative_target": {"head_pan": 0.0, "head_tilt": 0.0},
-        }
-        await self.push.send(msgpack.packb(payload, use_bin_type=True))
+        payload = build_command_payload(self.cfg.robot_id, targets, rel)
+        await self.push.send(pack_command(payload))
         self.last_send_ns = payload["stamp_ns"]
 
     async def _send_hold(self) -> None:
         if self.push is None:
             return
-        payload = {
-            "schema": SCHEMA_VERSION_V11,
-            "stamp_ns": time.monotonic_ns(),
-            "robot_id": self.cfg.robot_id,
-            "frame": "body",
-            "base_cmd_vel": [0.0, 0.0, 0.0],
-            "arm_joint_relative_target": {
+        payload = build_command_payload(
+            self.cfg.robot_id,
+            relative_by_side={
                 self.cfg.side: {"shoulder_pan": 0.0, "gripper": 0.0}
             },
-            "head_joint_relative_target": {"head_pan": 0.0, "head_tilt": 0.0},
-        }
-        await self.push.send(msgpack.packb(payload, use_bin_type=True))
+        )
+        await self.push.send(pack_command(payload))
         self.last_send_ns = payload["stamp_ns"]
 
 
@@ -836,19 +802,6 @@ def _vec3(value: Any) -> list[float]:
             v = 0.0
         out[idx] = v
     return out
-
-
-def _clamp_pose_to_workspace(side: str, pose: list[float]) -> list[float]:
-    mount = ARM_MOUNT_OFFSET[side]
-    delta = [float(pose[i]) - mount[i] for i in range(3)]
-    radius = math.sqrt(sum(v * v for v in delta))
-    if radius <= EE_REACH_RADIUS_M or radius <= 1e-9:
-        return pose
-    scale = EE_REACH_RADIUS_M / radius
-    clamped = list(pose)
-    for idx in range(3):
-        clamped[idx] = mount[idx] + delta[idx] * scale
-    return clamped
 
 
 async def index(request: web.Request) -> web.Response:

@@ -15,90 +15,21 @@ from __future__ import annotations
 import argparse
 import math
 import time
-from typing import Any
 
-import msgpack
 import zmq
 
-
-SCHEMA_VERSION_V11 = "xlerobot_v1.1"
-ARM_SIDES = ("right", "left")
-TF_TARGET_NAMES = {"right": "gripper_right", "left": "gripper_left"}
-DEFAULT_SIM_HOST = "100.80.87.68"
-
-
-def _pose_from_entry(entry: dict[str, Any]) -> list[float] | None:
-    pose = entry.get("pose")
-    if not isinstance(pose, (list, tuple)) or len(pose) != 7:
-        return None
-    try:
-        out = [float(v) for v in pose]
-    except (TypeError, ValueError):
-        return None
-    if not all(math.isfinite(v) for v in out):
-        return None
-    return out
-
-
-def collect_poses(
-    sub: zmq.Socket,
-    robot_id: int,
-    timeout_s: float,
-    sample_side: str = "right",
-) -> tuple[dict[str, list[float]], list[list[float]]]:
-    latest: dict[str, list[float]] = {}
-    samples: list[list[float]] = []
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            _topic, payload = sub.recv_multipart()
-        except zmq.Again:
-            continue
-        try:
-            msg = msgpack.unpackb(payload, raw=False)
-        except Exception:
-            continue
-        if int(msg.get("robot_id", robot_id)) != robot_id:
-            continue
-        for entry in msg.get("targets", []) or []:
-            name = entry.get("name")
-            pose = _pose_from_entry(entry)
-            if pose is None:
-                continue
-            for side, target_name in TF_TARGET_NAMES.items():
-                if name == target_name:
-                    latest[side] = pose
-                    if side == sample_side:
-                        samples.append(pose)
-    return latest, samples
-
-
-def send_targets(
-    push: zmq.Socket,
-    robot_id: int,
-    targets_by_side: dict[str, list[float]],
-) -> None:
-    payload = {
-        "schema": SCHEMA_VERSION_V11,
-        "stamp_ns": time.monotonic_ns(),
-        "robot_id": robot_id,
-        "frame": "body",
-        "base_cmd_vel": [0.0, 0.0, 0.0],
-        "arm_ee_pose_target": {
-            side: {"pose": pose, "mode": "absolute", "frame": "base"}
-            for side, pose in targets_by_side.items()
-        },
-        "arm_joint_relative_target": {
-            side: {"shoulder_pan": 0.0, "gripper": 0.0}
-            for side in targets_by_side.keys()
-        },
-        "head_joint_relative_target": {"head_pan": 0.0, "head_tilt": 0.0},
-    }
-    push.send(msgpack.packb(payload, use_bin_type=True))
+from teleop_common import (
+    ARM_SIDES,
+    DEFAULT_SIM_HOST,
+    TF_TARGET_NAMES,
+    collect_poses,
+    send_targets,
+    round_list,
+)
 
 
 def _round3(pose: list[float]) -> list[float]:
-    return [round(v, 6) for v in pose[:3]]
+    return round_list(pose[:3])
 
 
 def main() -> int:

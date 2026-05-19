@@ -16,45 +16,29 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import msgpack
 import zmq
 
-
-SCHEMA_VERSION_V11 = "xlerobot_v1.1"
-ARM_SIDES = ("right", "left")
-TF_TARGET_NAMES = {"right": "gripper_right", "left": "gripper_left"}
-DEFAULT_SIM_HOST = "100.80.87.68"
+from teleop_common import (
+    ARM_SIDES,
+    DEFAULT_SIM_HOST,
+    build_command_payload,
+    extract_tf_poses,
+    norm3,
+    pack_command,
+    round_list,
+    unpack_payload,
+)
 
 
 @dataclass(frozen=True)
 class Waypoint:
     name: str
     offset: tuple[float, float, float]
-
-
-def pose_from_entry(entry: dict[str, Any]) -> list[float] | None:
-    pose = entry.get("pose")
-    if not isinstance(pose, (list, tuple)) or len(pose) != 7:
-        return None
-    try:
-        out = [float(v) for v in pose]
-    except (TypeError, ValueError):
-        return None
-    return out if all(math.isfinite(v) for v in out) else None
-
-
-def norm3(a: list[float] | tuple[float, ...], b: list[float] | tuple[float, ...]) -> float:
-    return math.sqrt(sum((float(a[i]) - float(b[i])) ** 2 for i in range(3)))
-
-
-def round_list(values: list[float] | tuple[float, ...], digits: int = 6) -> list[float]:
-    return [round(float(v), digits) for v in values]
 
 
 def build_default_scenario(step_m: float, lateral_step_m: float) -> list[Waypoint]:
@@ -120,21 +104,16 @@ class SimEeVerifier:
                     return samples
                 continue
             try:
-                msg = msgpack.unpackb(payload, raw=False)
+                msg = unpack_payload(payload)
             except Exception:
                 continue
             if int(msg.get("robot_id", self.args.robot_id)) != self.args.robot_id:
                 continue
-            for entry in msg.get("targets", []) or []:
-                name = entry.get("name")
-                pose = pose_from_entry(entry)
-                if pose is None:
-                    continue
-                for side, target_name in TF_TARGET_NAMES.items():
-                    if name == target_name:
-                        self.latest[side] = pose
-                        if side == self.args.side:
-                            samples.append(pose)
+            updates = extract_tf_poses(msg)
+            for side, pose in updates.items():
+                self.latest[side] = pose
+                if side == self.args.side:
+                    samples.append(pose)
 
     def wait_for_poses(self) -> dict[str, list[float]]:
         self.drain_tf(self.args.anchor_timeout)
@@ -144,23 +123,8 @@ class SimEeVerifier:
         return {side: list(pose) for side, pose in self.latest.items()}
 
     def send_targets(self, target_by_side: dict[str, list[float]]) -> None:
-        payload = {
-            "schema": SCHEMA_VERSION_V11,
-            "stamp_ns": time.monotonic_ns(),
-            "robot_id": self.args.robot_id,
-            "frame": "body",
-            "base_cmd_vel": [0.0, 0.0, 0.0],
-            "arm_ee_pose_target": {
-                side: {"pose": pose, "mode": "absolute", "frame": "base"}
-                for side, pose in target_by_side.items()
-            },
-            "arm_joint_relative_target": {
-                side: {"shoulder_pan": 0.0, "gripper": 0.0}
-                for side in target_by_side.keys()
-            },
-            "head_joint_relative_target": {"head_pan": 0.0, "head_tilt": 0.0},
-        }
-        self.push.send(msgpack.packb(payload, use_bin_type=True))
+        payload = build_command_payload(self.args.robot_id, target_by_side)
+        self.push.send(pack_command(payload))
 
     def compose_targets(self, side: str, target_xyz: tuple[float, float, float]) -> dict[str, list[float]]:
         targets: dict[str, list[float]] = {}
