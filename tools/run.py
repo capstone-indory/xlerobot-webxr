@@ -356,7 +356,7 @@ def main() -> int:
     g_vr.add_argument("--pose-host", default="127.0.0.1")
     g_vr.add_argument("--pose-port", type=int, default=7001)
     g_vr.add_argument("--vr-side", choices=["right", "left", "both"], default="right")
-    g_vr.add_argument("--vr-position-scale", type=float, default=0.5)
+    g_vr.add_argument("--vr-position-scale", type=float, default=1.0)
     g_vr.add_argument("--vr-grip-threshold", type=float, default=0.5)
     # ── 공통 ───────────────────────────────────────────────────────────
     p.add_argument("--log-level", default="INFO")

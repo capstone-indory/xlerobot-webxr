@@ -23,16 +23,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import msgpack
 import zmq
+
+from teleop_common import (
+    ARM_SIDES,
+    build_command_payload,
+    clamp_pose_to_workspace,
+    extract_tf_poses,
+    pack_command,
+    unpack_payload,
+)
 
 
 log = logging.getLogger("vr_direct_teleop")
 
-SCHEMA_VERSION_V11 = "xlerobot_v1.1"
 PAGE_SCHEMA = "xlerobot_v1.1.page"
-ARM_SIDES = ("right", "left")
-TF_TARGET_NAMES = {"right": "gripper_right", "left": "gripper_left"}
 BUTTON_ANCHOR = {"right": "a", "left": "x"}
 
 
@@ -202,19 +207,14 @@ class DirectVrBridge:
             except zmq.Again:
                 return
             try:
-                msg = msgpack.unpackb(payload, raw=False)
+                msg = unpack_payload(payload)
             except Exception:
                 continue
-            for entry in msg.get("targets", []) or []:
-                name = entry.get("name")
-                pose = pose7(entry.get("pose"))
-                if pose is None:
-                    continue
-                for side, target_name in TF_TARGET_NAMES.items():
-                    if name == target_name:
-                        self.state.latest_ee[side] = pose
-                        if side == "right":
-                            self._track_right_motion(pose)
+            updates = extract_tf_poses(msg)
+            for side, pose in updates.items():
+                self.state.latest_ee[side] = pose
+                if side == "right":
+                    self._track_right_motion(pose)
 
     def _drain_pose(self) -> None:
         assert self.pose_sub is not None
@@ -224,7 +224,7 @@ class DirectVrBridge:
             except zmq.Again:
                 return
             try:
-                sample = msgpack.unpackb(payload, raw=False)
+                sample = unpack_payload(payload)
             except Exception as exc:
                 log.warning("pose decode failed: %s", exc)
                 continue
@@ -393,6 +393,7 @@ class DirectVrBridge:
         target = list(arm.anchor.ee_pose)
         for idx in range(3):
             target[idx] += delta_robot[idx]
+        target = clamp_pose_to_workspace(side, target)
         # Keep orientation floating with measured tf.links orientation. This
         # avoids over-constraining the 4-DoF IK arm during translation checks.
         current = self.state.latest_ee.get(side)
@@ -414,20 +415,8 @@ class DirectVrBridge:
         rel: dict[str, dict[str, float]],
     ) -> None:
         assert self.push is not None
-        payload = {
-            "schema": SCHEMA_VERSION_V11,
-            "stamp_ns": time.monotonic_ns(),
-            "robot_id": self.args.robot_id,
-            "frame": "body",
-            "base_cmd_vel": [0.0, 0.0, 0.0],
-            "arm_ee_pose_target": {
-                side: {"pose": pose, "mode": "absolute", "frame": "base"}
-                for side, pose in targets.items()
-            },
-            "arm_joint_relative_target": rel,
-            "head_joint_relative_target": {"head_pan": 0.0, "head_tilt": 0.0},
-        }
-        self.push.send(msgpack.packb(payload, use_bin_type=True))
+        payload = build_command_payload(self.args.robot_id, targets, rel)
+        self.push.send(pack_command(payload))
 
 
 def parse_args() -> argparse.Namespace:
@@ -444,7 +433,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-id", type=int, default=0)
     parser.add_argument("--side", choices=["right", "left", "both"], default="right")
     parser.add_argument("--rate-hz", type=float, default=60.0)
-    parser.add_argument("--position-scale", type=float, default=0.5)
+    parser.add_argument("--position-scale", type=float, default=1.0)
     parser.add_argument("--grip-threshold", type=float, default=0.5)
     parser.add_argument("--gripper-per-tick", type=float, default=0.01)
     parser.add_argument("--stale-ms", type=float, default=150.0)

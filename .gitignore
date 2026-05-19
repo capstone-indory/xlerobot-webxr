@@ -8,6 +8,10 @@ __pycache__/
 .venv/
 venv/
 
+# generated verification reports
+tools/reports/*.csv
+tools/reports/*.jsonl
+
 # editor
 .vscode/
 .idea/

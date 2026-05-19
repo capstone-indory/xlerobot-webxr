@@ -28,19 +28,27 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import msgpack
 import zmq
 import zmq.asyncio
 from aiohttp import WSMsgType, web
 
+from teleop_common import (
+    ARM_SIDES,
+    DEFAULT_SIM_HOST,
+    build_command_payload,
+    clamp_pose_to_workspace,
+    extract_tf_poses,
+    pack_command,
+    unpack_payload,
+)
+
 
 log = logging.getLogger("keyboard_teleop")
 
-SCHEMA_VERSION_V11 = "xlerobot_v1.1"
-TF_TARGET_NAMES = {"right": "gripper_right", "left": "gripper_left"}
-ARM_SIDES = ("right", "left")
-DEFAULT_SIM_HOST = "100.80.87.68"
 DEFAULT_ROBOT_ID = 0
+DEFAULT_STEP_M = 0.080
+DEFAULT_SPEED_MPS = 0.500
+DEFAULT_MAX_OFFSET_M = 0.300
 
 
 HTML = r"""<!doctype html>
@@ -152,11 +160,13 @@ HTML = r"""<!doctype html>
 const query = new URLSearchParams(location.search);
 const robotId = Number.parseInt(query.get("robot") || "0", 10);
 const sendHz = Number.parseFloat(query.get("hz") || "60");
-const stepM = Number.parseFloat(query.get("step") || "0.030");
-const maxOffset = Number.parseFloat(query.get("max_offset") || "0.120");
+const stepM = Number.parseFloat(query.get("step") || "0.080");
+const speedMps = Number.parseFloat(query.get("speed") || "0.500");
+const maxOffset = Number.parseFloat(query.get("max_offset") || "0.300");
 const panStep = Number.parseFloat(query.get("pan_step") || "0.050");
 const gripStep = Number.parseFloat(query.get("grip_step") || "0.010");
 const maxPan = Number.parseFloat(query.get("max_pan") || "0.700");
+const motionKeys = new Set(["KeyW", "KeyS", "KeyR", "KeyF"]);
 const pressed = new Set();
 const queuedNudge = [0, 0, 0];
 const targetOffset = [0, 0, 0];
@@ -169,7 +179,8 @@ let reanchor = false;
 let ws = null;
 let frames = 0;
 let sentInWindow = 0;
-let lastTick = performance.now();
+let lastRenderTick = performance.now();
+let lastSendTick = performance.now();
 
 const $ = (id) => document.getElementById(id);
 window.addEventListener("load", () => document.body.focus());
@@ -221,6 +232,22 @@ function moveStep() {
   const gain = (pressed.has("ShiftLeft") || pressed.has("ShiftRight")) ? 2.5 : 1.0;
   return stepM * gain;
 }
+function moveSpeed() {
+  const gain = (pressed.has("ShiftLeft") || pressed.has("ShiftRight")) ? 3.0 : 1.0;
+  return speedMps * gain;
+}
+function applyNudgeVector(next) {
+  const applied = [0, 0, 0];
+  if (next.some(v => v !== 0)) {
+    for (let i = 0; i < 3; i += 1) {
+      const before = targetOffset[i];
+      targetOffset[i] = clamp(before + next[i], -maxOffset, maxOffset);
+      applied[i] = targetOffset[i] - before;
+    }
+    active = true;
+  }
+  return applied;
+}
 function queueNudge(code) {
   const move = moveStep();
   const next = [0, 0, 0];
@@ -228,14 +255,21 @@ function queueNudge(code) {
   if (code === "KeyS") next[2] = -move;
   if (code === "KeyR") next[0] = +move;
   if (code === "KeyF") next[0] = -move;
-  if (next.some(v => v !== 0)) {
-    for (let i = 0; i < 3; i += 1) {
-      queuedNudge[i] += next[i];
-      targetOffset[i] = clamp(targetOffset[i] + next[i], -maxOffset, maxOffset);
-    }
-    active = true;
+  const applied = applyNudgeVector(next);
+  if (applied.some(v => v !== 0)) {
+    for (let i = 0; i < 3; i += 1) queuedNudge[i] += applied[i];
     lastInput = code;
   }
+}
+function heldNudge(dt) {
+  if (dt <= 0) return [0, 0, 0];
+  const move = moveSpeed() * dt;
+  const next = [0, 0, 0];
+  if (pressed.has("KeyW")) next[2] += move;
+  if (pressed.has("KeyS")) next[2] -= move;
+  if (pressed.has("KeyR")) next[0] += move;
+  if (pressed.has("KeyF")) next[0] -= move;
+  return applyNudgeVector(next);
 }
 function tapInput(code) {
   if (code === "Space") {
@@ -269,9 +303,11 @@ function gripperDelta() {
   if (pressed.has("KeyX")) delta += gripStep;
   return delta;
 }
-function sendCommand() {
+function sendCommand(dt = 0) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const nudge = queuedNudge.slice();
+  const held = heldNudge(dt);
+  for (let i = 0; i < 3; i += 1) nudge[i] += held[i];
   lastNudge = nudge.slice();
   queuedNudge[0] = 0; queuedNudge[1] = 0; queuedNudge[2] = 0;
   ws.send(JSON.stringify({
@@ -303,11 +339,19 @@ function render() {
   updateKeys();
 }
 function loop(now) {
-  const dt = Math.min(0.05, Math.max(0.001, (now - lastTick) / 1000));
-  lastTick = now;
-  sendCommand();
+  const renderDt = Math.min(0.05, Math.max(0.001, (now - lastRenderTick) / 1000));
+  lastRenderTick = now;
+  const sendPeriodMs = 1000 / Math.max(1, sendHz);
+  if (now - lastSendTick >= sendPeriodMs - 1.0) {
+    const sendDt = Math.min(0.05, Math.max(0.001, (now - lastSendTick) / 1000));
+    lastSendTick = now;
+    sendCommand(sendDt);
+  } else if (queuedNudge.some(v => v !== 0)) {
+    sendCommand(renderDt);
+    lastSendTick = now;
+  }
   render();
-  setTimeout(() => requestAnimationFrame(loop), 1000 / sendHz);
+  requestAnimationFrame(loop);
 }
 setInterval(() => {
   $("rate").textContent = `tx: ${sentInWindow} Hz`;
@@ -330,8 +374,12 @@ window.addEventListener("keydown", (e) => {
     targetOffset[0] = 0; targetOffset[1] = 0; targetOffset[2] = 0;
     pressed.add(code);
     lastInput = code;
+  } else if (motionKeys.has(code)) {
+    if (!pressed.has(code) && !e.repeat) queueNudge(code);
+    pressed.add(code);
+    active = true;
+    lastInput = code || lastInput;
   } else {
-    queueNudge(code);
     pressed.add(code);
     active = true;
     lastInput = code || lastInput;
@@ -364,18 +412,18 @@ for (const code of ["KeyW","KeyA","KeyS","KeyD","KeyR","KeyF","KeyZ","KeyX","Dig
       targetOffset[0] = 0; targetOffset[1] = 0; targetOffset[2] = 0;
     } else {
       pressed.add(code);
-      queueNudge(code);
+      if (motionKeys.has(code)) queueNudge(code);
     }
     active = code === "Space" ? active : true;
     lastInput = code;
-    sendCommand();
+    sendCommand(0);
     render();
   };
   const up = (e) => {
     e.preventDefault();
     pressed.delete(code);
     if (!pressed.size) lastInput = "idle";
-    sendCommand();
+    sendCommand(0);
     render();
   };
   el.addEventListener("pointerdown", down);
@@ -386,7 +434,7 @@ for (const code of ["KeyW","KeyA","KeyS","KeyD","KeyR","KeyF","KeyZ","KeyX","Dig
     e.preventDefault();
     if (performance.now() - pointerStarted < 250) return;
     const transient = tapInput(code);
-    sendCommand();
+    sendCommand(0);
     if (transient) pressed.delete(code);
     render();
   });
@@ -502,18 +550,10 @@ class DirectSimTeleop:
         while True:
             topic, payload = await self.sub.recv_multipart()
             try:
-                msg = msgpack.unpackb(payload, raw=False)
+                msg = unpack_payload(payload)
             except Exception:
                 continue
-            updates: dict[str, list[float]] = {}
-            for entry in msg.get("targets", []) or []:
-                name = entry.get("name")
-                pose = entry.get("pose")
-                if not isinstance(pose, (list, tuple)) or len(pose) != 7:
-                    continue
-                for side, target_name in TF_TARGET_NAMES.items():
-                    if name == target_name:
-                        updates[side] = [float(v) for v in pose]
+            updates = extract_tf_poses(msg)
             if not updates:
                 continue
             self.latest_ee.update(updates)
@@ -616,6 +656,12 @@ class DirectSimTeleop:
             pose[3:7] = current[3:7]
         for idx, delta in enumerate(deltas):
             pose[idx] += float(delta)
+        pose = clamp_pose_to_workspace(side, pose)
+        anchor = self.anchor_ee.get(side)
+        if isinstance(anchor, list) and len(anchor) >= 3:
+            self.target_offsets[side] = [
+                float(pose[idx]) - float(anchor[idx]) for idx in range(3)
+            ]
         return pose
 
     def _hold_targets(self) -> dict[str, list[float]]:
@@ -644,63 +690,37 @@ class DirectSimTeleop:
     ) -> None:
         if self.push is None:
             return
-        payload = {
-            "schema": SCHEMA_VERSION_V11,
-            "stamp_ns": time.monotonic_ns(),
-            "robot_id": self.cfg.robot_id,
-            "frame": "body",
-            "base_cmd_vel": [0.0, 0.0, 0.0],
-            "arm_ee_pose_target": {
-                side: {"pose": pose, "mode": "absolute", "frame": "base"}
-                for side, pose in targets_by_side.items()
-            },
-            "arm_joint_relative_target": rel,
-            "head_joint_relative_target": {"head_pan": 0.0, "head_tilt": 0.0},
-        }
-        await self.push.send(msgpack.packb(payload, use_bin_type=True))
+        payload = build_command_payload(self.cfg.robot_id, targets_by_side, rel)
+        await self.push.send(pack_command(payload))
         self.last_send_ns = payload["stamp_ns"]
 
     async def _send_pose_hold(self, sides: tuple[str, ...]) -> None:
         if self.push is None:
             return
-        targets: dict[str, dict[str, Any]] = {}
+        targets: dict[str, list[float]] = {}
         rel: dict[str, dict[str, float]] = {}
         for side in sides:
             pose = self._hold_pose(side)
             if pose is None:
                 continue
-            targets[side] = {"pose": pose, "mode": "absolute", "frame": "base"}
+            targets[side] = pose
             rel[side] = {"shoulder_pan": 0.0, "gripper": 0.0}
         if not targets:
             return
-        payload = {
-            "schema": SCHEMA_VERSION_V11,
-            "stamp_ns": time.monotonic_ns(),
-            "robot_id": self.cfg.robot_id,
-            "frame": "body",
-            "base_cmd_vel": [0.0, 0.0, 0.0],
-            "arm_ee_pose_target": targets,
-            "arm_joint_relative_target": rel,
-            "head_joint_relative_target": {"head_pan": 0.0, "head_tilt": 0.0},
-        }
-        await self.push.send(msgpack.packb(payload, use_bin_type=True))
+        payload = build_command_payload(self.cfg.robot_id, targets, rel)
+        await self.push.send(pack_command(payload))
         self.last_send_ns = payload["stamp_ns"]
 
     async def _send_hold(self) -> None:
         if self.push is None:
             return
-        payload = {
-            "schema": SCHEMA_VERSION_V11,
-            "stamp_ns": time.monotonic_ns(),
-            "robot_id": self.cfg.robot_id,
-            "frame": "body",
-            "base_cmd_vel": [0.0, 0.0, 0.0],
-            "arm_joint_relative_target": {
+        payload = build_command_payload(
+            self.cfg.robot_id,
+            relative_by_side={
                 self.cfg.side: {"shoulder_pan": 0.0, "gripper": 0.0}
             },
-            "head_joint_relative_target": {"head_pan": 0.0, "head_tilt": 0.0},
-        }
-        await self.push.send(msgpack.packb(payload, use_bin_type=True))
+        )
+        await self.push.send(pack_command(payload))
         self.last_send_ns = payload["stamp_ns"]
 
 
@@ -852,7 +872,7 @@ async def api_nudge(request: web.Request) -> web.Response:
     code = str(data.get("code") or request.query.get("code") or "")
     frames = int(float(data.get("frames") or request.query.get("frames") or 5))
     hz = float(data.get("hz") or request.query.get("hz") or 60.0)
-    step_m = float(data.get("step") or request.query.get("step") or 0.030)
+    step_m = float(data.get("step") or request.query.get("step") or DEFAULT_STEP_M)
     pan_step = float(data.get("pan_step") or request.query.get("pan_step") or 0.050)
     grip_step = float(data.get("grip_step") or request.query.get("grip_step") or 0.010)
     frames = max(1, min(frames, 30))
@@ -958,7 +978,7 @@ def main() -> int:
     parser.add_argument(
         "--max-offset",
         type=float,
-        default=0.12,
+        default=DEFAULT_MAX_OFFSET_M,
         help="Clamp accumulated EE target offset to +/- this many meters per axis.",
     )
     parser.add_argument(
