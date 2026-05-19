@@ -285,12 +285,13 @@ python3 tools/run.py \
 ```
 
 브라우저에서 `http://127.0.0.1:8765/?robot=0`을 열면 키보드 입력만으로 오른팔
-EE target이 움직인다. 기본 tap nudge는 `step=0.05`m이고, 키를 누르고 있으면
-브라우저 key-repeat을 기다리지 않고 `speed=0.24`m/s로 매 frame nudge를 누적한다.
+EE target이 움직인다. 기본 tap nudge는 `step=0.08`m이고, 키를 누르고 있으면
+브라우저 key-repeat을 기다리지 않고 `speed=0.50`m/s로 매 frame nudge를 누적한다.
 W/S는 위/아래, R/F는 앞/뒤 EE target nudge, A/D는 shoulder pan, Z/X는 gripper
 delta다. EE nudge는 `tf.links.<robot_id>`에서 잡은 anchor 기준 offset으로 누적되고,
 기본 `--max-offset 0.30`m 범위와 sim EE reach sphere 안쪽으로 clamp된다.
-입력 직후에는 서버가 최신 EE target을 기본 5초 동안 60Hz로 유지 송신한다. sim은
+브라우저 전송 loop는 `requestAnimationFrame`으로 계속 돌며 `hz` query 값으로만
+throttle한다. 입력 직후에는 서버가 최신 EE target을 기본 5초 동안 60Hz로 유지 송신한다. sim은
 PULL 큐를 최신 명령 위주로 처리하지만, 실제 EE pose target은 짧은 one-shot보다
 몇 초간 유지 송신할 때 안정적으로 반영된다.
 버튼은 JS pointer/keyboard handler가 실패해도 같은 동작을 `POST /api/nudge`

@@ -46,8 +46,8 @@ from teleop_common import (
 log = logging.getLogger("keyboard_teleop")
 
 DEFAULT_ROBOT_ID = 0
-DEFAULT_STEP_M = 0.050
-DEFAULT_SPEED_MPS = 0.240
+DEFAULT_STEP_M = 0.080
+DEFAULT_SPEED_MPS = 0.500
 DEFAULT_MAX_OFFSET_M = 0.300
 
 
@@ -160,8 +160,8 @@ HTML = r"""<!doctype html>
 const query = new URLSearchParams(location.search);
 const robotId = Number.parseInt(query.get("robot") || "0", 10);
 const sendHz = Number.parseFloat(query.get("hz") || "60");
-const stepM = Number.parseFloat(query.get("step") || "0.050");
-const speedMps = Number.parseFloat(query.get("speed") || "0.240");
+const stepM = Number.parseFloat(query.get("step") || "0.080");
+const speedMps = Number.parseFloat(query.get("speed") || "0.500");
 const maxOffset = Number.parseFloat(query.get("max_offset") || "0.300");
 const panStep = Number.parseFloat(query.get("pan_step") || "0.050");
 const gripStep = Number.parseFloat(query.get("grip_step") || "0.010");
@@ -179,7 +179,8 @@ let reanchor = false;
 let ws = null;
 let frames = 0;
 let sentInWindow = 0;
-let lastTick = performance.now();
+let lastRenderTick = performance.now();
+let lastSendTick = performance.now();
 
 const $ = (id) => document.getElementById(id);
 window.addEventListener("load", () => document.body.focus());
@@ -338,11 +339,19 @@ function render() {
   updateKeys();
 }
 function loop(now) {
-  const dt = Math.min(0.05, Math.max(0.001, (now - lastTick) / 1000));
-  lastTick = now;
-  sendCommand(dt);
+  const renderDt = Math.min(0.05, Math.max(0.001, (now - lastRenderTick) / 1000));
+  lastRenderTick = now;
+  const sendPeriodMs = 1000 / Math.max(1, sendHz);
+  if (now - lastSendTick >= sendPeriodMs - 1.0) {
+    const sendDt = Math.min(0.05, Math.max(0.001, (now - lastSendTick) / 1000));
+    lastSendTick = now;
+    sendCommand(sendDt);
+  } else if (queuedNudge.some(v => v !== 0)) {
+    sendCommand(renderDt);
+    lastSendTick = now;
+  }
   render();
-  setTimeout(() => requestAnimationFrame(loop), 1000 / sendHz);
+  requestAnimationFrame(loop);
 }
 setInterval(() => {
   $("rate").textContent = `tx: ${sentInWindow} Hz`;

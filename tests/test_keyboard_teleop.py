@@ -106,3 +106,10 @@ def test_common_tf_pose_parser_rejects_nonfinite_values():
     poses = teleop_common.extract_tf_poses(msg)
 
     assert poses == {"right": [1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]}
+
+
+def test_browser_loop_does_not_double_throttle_with_timeout_and_raf():
+    assert 'query.get("step") || "0.080"' in keyboard_teleop.HTML
+    assert 'query.get("speed") || "0.500"' in keyboard_teleop.HTML
+    assert "requestAnimationFrame(loop);" in keyboard_teleop.HTML
+    assert "setTimeout(() => requestAnimationFrame(loop)" not in keyboard_teleop.HTML

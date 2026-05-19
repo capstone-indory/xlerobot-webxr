@@ -28,6 +28,7 @@ import zmq
 from teleop_common import (
     ARM_SIDES,
     build_command_payload,
+    clamp_pose_to_workspace,
     extract_tf_poses,
     pack_command,
     unpack_payload,
@@ -392,6 +393,7 @@ class DirectVrBridge:
         target = list(arm.anchor.ee_pose)
         for idx in range(3):
             target[idx] += delta_robot[idx]
+        target = clamp_pose_to_workspace(side, target)
         # Keep orientation floating with measured tf.links orientation. This
         # avoids over-constraining the 4-DoF IK arm during translation checks.
         current = self.state.latest_ee.get(side)
