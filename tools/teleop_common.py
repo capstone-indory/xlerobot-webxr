@@ -17,9 +17,14 @@ import zmq
 
 
 SCHEMA_VERSION_V11 = "xlerobot_v1.1"
+SCHEMA_VERSION = "xlerobot_v1"
 ARM_SIDES = ("right", "left")
 TF_TARGET_NAMES = {"right": "gripper_right", "left": "gripper_left"}
 DEFAULT_SIM_HOST = "100.80.87.68"
+COMMAND_SOURCE_ROLES = ("teleop", "policy", "safety", "script")
+COMMAND_PRIORITY_RANGE = (0, 100)
+COMMAND_LEASE_MS_RANGE = (1, 60_000)
+COMMAND_SOURCE_ID_MAX_LEN = 128
 
 EE_REACH_RADIUS_M = 0.56
 ARM_MOUNT_OFFSET = {
@@ -70,6 +75,55 @@ def round_list(values: list[float] | tuple[float, ...], digits: int = 6) -> list
     return [round(float(v), digits) for v in values]
 
 
+def summarize_vr_decode_debug(
+    debug: Mapping[str, Any] | None,
+    side: str,
+) -> dict[str, Any] | None:
+    if not isinstance(debug, Mapping):
+        return None
+    arms = debug.get("arms")
+    if not isinstance(arms, Mapping):
+        return None
+    entry = arms.get(side)
+    if not isinstance(entry, Mapping):
+        return None
+    out: dict[str, Any] = {
+        "changed": bool(entry.get("changed_by_decoder", False)),
+        "coarse_clamped": bool(entry.get("coarse_clamped", False)),
+        "joint_projected": bool(entry.get("joint_limited_projected", False)),
+        "solver": entry.get("solver"),
+    }
+    residual = entry.get("residual_m")
+    if isinstance(residual, (int, float)) and math.isfinite(float(residual)):
+        out["residual_m"] = round(float(residual), 6)
+    projection_mode = entry.get("projection_mode")
+    if isinstance(projection_mode, str):
+        out["projection_mode"] = projection_mode
+    for key in ("requested_pose_base", "target_pose_base"):
+        pose = entry.get(key)
+        if isinstance(pose, (list, tuple)) and len(pose) >= 3:
+            out[key.replace("_pose_base", "_xyz")] = round_list(pose[:3])
+    return out
+
+
+def cmd_echo_latency_ms(
+    msg: Mapping[str, Any],
+    *,
+    now_ns: int | None = None,
+    min_stamp_ns: int = 0,
+) -> float | None:
+    echo = msg.get("cmd_echo_stamp_ns")
+    if not isinstance(echo, int) or echo <= 0:
+        return None
+    if echo < int(min_stamp_ns):
+        return None
+    now = time.monotonic_ns() if now_ns is None else int(now_ns)
+    latency_ms = (now - int(echo)) / 1e6
+    if latency_ms < 0.0 or not math.isfinite(latency_ms):
+        return None
+    return latency_ms
+
+
 def clamp_pose_to_workspace(
     side: str,
     pose: list[float],
@@ -98,6 +152,10 @@ def build_command_payload(
     relative_by_side: Mapping[str, Mapping[str, float]] | None = None,
     *,
     stamp_ns: int | None = None,
+    source_id: str | None = None,
+    source_role: str | None = None,
+    priority: int | None = None,
+    lease_ms: int | None = None,
 ) -> dict[str, Any]:
     targets = dict(targets_by_side or {})
     if relative_by_side is None:
@@ -125,11 +183,80 @@ def build_command_payload(
             side: {"pose": list(pose), "mode": "absolute", "frame": "base"}
             for side, pose in targets.items()
         }
+    add_command_metadata(
+        payload,
+        source_id=source_id,
+        source_role=source_role,
+        priority=priority,
+        lease_ms=lease_ms,
+    )
     return payload
+
+
+def add_command_metadata(
+    payload: dict[str, Any],
+    *,
+    source_id: str | None,
+    source_role: str | None,
+    priority: int | None,
+    lease_ms: int | None,
+) -> None:
+    if source_id is None:
+        if source_role is not None or priority is not None or lease_ms is not None:
+            raise ValueError("command source metadata requires source_id")
+        return
+    if not isinstance(source_id, str) or not source_id:
+        raise ValueError("source_id must be a non-empty string")
+    if len(source_id) > COMMAND_SOURCE_ID_MAX_LEN:
+        raise ValueError(f"source_id must be <= {COMMAND_SOURCE_ID_MAX_LEN} characters")
+    payload["source_id"] = source_id
+
+    if source_role is not None:
+        if source_role not in COMMAND_SOURCE_ROLES:
+            raise ValueError(
+                f"source_role must be one of {COMMAND_SOURCE_ROLES}, got {source_role!r}"
+            )
+        payload["source_role"] = source_role
+    if priority is not None:
+        if not isinstance(priority, int) or isinstance(priority, bool):
+            raise ValueError(f"priority must be int, got {type(priority).__name__}")
+        lo, hi = COMMAND_PRIORITY_RANGE
+        if not (lo <= priority <= hi):
+            raise ValueError(f"priority must be in [{lo}, {hi}], got {priority}")
+        payload["priority"] = priority
+    if lease_ms is not None:
+        if not isinstance(lease_ms, int) or isinstance(lease_ms, bool):
+            raise ValueError(f"lease_ms must be int, got {type(lease_ms).__name__}")
+        lo, hi = COMMAND_LEASE_MS_RANGE
+        if not (lo <= lease_ms <= hi):
+            raise ValueError(f"lease_ms must be in [{lo}, {hi}], got {lease_ms}")
+        payload["lease_ms"] = lease_ms
 
 
 def pack_command(payload: Mapping[str, Any]) -> bytes:
     return msgpack.packb(payload, use_bin_type=True)
+
+
+def rpc_request(
+    host: str,
+    port: int,
+    op: str,
+    *,
+    timeout_ms: int = 500,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    ctx = zmq.Context.instance()
+    sock = ctx.socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, int(timeout_ms))
+    sock.setsockopt(zmq.SNDTIMEO, int(timeout_ms))
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.connect(f"tcp://{host}:{port}")
+    try:
+        sock.send(msgpack.packb({"schema": SCHEMA_VERSION, "op": op, **kwargs}, use_bin_type=True))
+        reply = msgpack.unpackb(sock.recv(), raw=False)
+        return reply if isinstance(reply, dict) else {}
+    finally:
+        sock.close(linger=0)
 
 
 def connect_tf_sub(
@@ -207,6 +334,10 @@ class TfReader:
     def __init__(self, host: str, port: int, robot_id: int, side: str) -> None:
         self.robot_id = int(robot_id)
         self.side = side
+        self.last_decode_debug: dict[str, Any] | None = None
+        self.first_cmd_echo_latency_ms: float | None = None
+        self.last_cmd_echo_latency_ms: float | None = None
+        self.first_cmd_echo_stamp_ns: int | None = None
         if side not in TF_TARGET_NAMES:
             raise ValueError(f"unknown arm side: {side}")
         self.ctx = zmq.Context.instance()
@@ -229,6 +360,10 @@ class TfReader:
                 continue
             if int(msg.get("robot_id", self.robot_id)) != self.robot_id:
                 continue
+            debug = msg.get("vr_decode_debug")
+            if isinstance(debug, dict):
+                self.last_decode_debug = debug
+            self._record_cmd_echo(msg)
             pose = extract_tf_poses(msg).get(self.side)
             if pose is not None:
                 latest = pose
@@ -240,6 +375,7 @@ class TfReader:
         *,
         timeout_s: float,
         move_threshold_m: float,
+        min_cmd_echo_stamp_ns: int = 0,
     ) -> tuple[float | None, float, list[float] | None, int]:
         deadline = time.monotonic() + timeout_s
         first_move_s: float | None = None
@@ -247,6 +383,9 @@ class TfReader:
         last_pose: list[float] | None = None
         samples = 0
         t0 = time.monotonic()
+        self.first_cmd_echo_latency_ms = None
+        self.last_cmd_echo_latency_ms = None
+        self.first_cmd_echo_stamp_ns = None
         while time.monotonic() < deadline:
             try:
                 _topic, payload = self.sub.recv_multipart()
@@ -258,6 +397,10 @@ class TfReader:
                 continue
             if int(msg.get("robot_id", self.robot_id)) != self.robot_id:
                 continue
+            debug = msg.get("vr_decode_debug")
+            if isinstance(debug, dict):
+                self.last_decode_debug = debug
+            self._record_cmd_echo(msg, min_stamp_ns=min_cmd_echo_stamp_ns)
             pose = extract_tf_poses(msg).get(self.side)
             if pose is None:
                 continue
@@ -268,3 +411,21 @@ class TfReader:
             if first_move_s is None and move >= move_threshold_m:
                 first_move_s = time.monotonic() - t0
         return first_move_s, max_move, last_pose, samples
+
+    def decode_debug_summary(self) -> dict[str, Any] | None:
+        return summarize_vr_decode_debug(self.last_decode_debug, self.side)
+
+    def _record_cmd_echo(
+        self,
+        msg: Mapping[str, Any],
+        *,
+        min_stamp_ns: int = 0,
+    ) -> None:
+        latency_ms = cmd_echo_latency_ms(msg, min_stamp_ns=min_stamp_ns)
+        if latency_ms is None:
+            return
+        echo = msg.get("cmd_echo_stamp_ns")
+        if self.first_cmd_echo_latency_ms is None:
+            self.first_cmd_echo_latency_ms = latency_ms
+            self.first_cmd_echo_stamp_ns = int(echo)
+        self.last_cmd_echo_latency_ms = latency_ms

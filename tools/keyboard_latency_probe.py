@@ -58,7 +58,7 @@ def main() -> int:
     parser.add_argument("--code", default="KeyR", help="Keyboard code sent to /api/nudge.")
     parser.add_argument("--step", type=float, default=0.05)
     parser.add_argument("--frames", type=int, default=5)
-    parser.add_argument("--hz", type=float, default=60.0)
+    parser.add_argument("--hz", type=float, default=90.0)
     parser.add_argument("--move-threshold", type=float, default=0.002)
     parser.add_argument("--observe-s", type=float, default=2.0)
     parser.add_argument("--anchor-timeout", type=float, default=3.0)
@@ -78,6 +78,7 @@ def main() -> int:
             return 2
         print("start", round_list(start_pose[:3]))
 
+        sent_start_ns = time.monotonic_ns()
         sent_t = time.monotonic()
         reply = _http_json(
             f"{base}/api/nudge",
@@ -99,8 +100,26 @@ def main() -> int:
             start_pose,
             timeout_s=args.observe_s,
             move_threshold_m=args.move_threshold,
+            min_cmd_echo_stamp_ns=sent_start_ns,
         )
         print("last", None if last_pose is None else round_list(last_pose[:3]))
+        decode_debug = reader.decode_debug_summary()
+        if decode_debug is not None:
+            print("decode_debug", json.dumps(decode_debug, ensure_ascii=False))
+        if reader.first_cmd_echo_latency_ms is not None:
+            print(
+                "cmd_echo",
+                json.dumps(
+                    {
+                        "first_ms": round(reader.first_cmd_echo_latency_ms, 2),
+                        "last_ms": None
+                        if reader.last_cmd_echo_latency_ms is None
+                        else round(reader.last_cmd_echo_latency_ms, 2),
+                        "stamp_ns": reader.first_cmd_echo_stamp_ns,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
         print(
             "summary",
             json.dumps(
@@ -111,6 +130,10 @@ def main() -> int:
                     "max_move_m": round(max_move, 6),
                     "samples": samples,
                     "post_rtt_ms": round(post_rtt_ms, 2),
+                    "first_cmd_echo_ms": None
+                    if reader.first_cmd_echo_latency_ms is None
+                    else round(reader.first_cmd_echo_latency_ms, 2),
+                    "decode_debug": decode_debug,
                 },
                 ensure_ascii=False,
             ),

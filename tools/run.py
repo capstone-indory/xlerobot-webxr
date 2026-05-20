@@ -201,8 +201,12 @@ def _keyboard_teleop_spec(args: argparse.Namespace) -> ChildSpec:
         "--sim-host", args.sim_host,
         "--sim-pub-port", str(args.sim_port),
         "--sim-pull-port", str(args.sim_pull_port),
+        "--sim-rep-port", str(args.sim_rep_port),
         "--robot-id", str(args.sim_robot_id),
         "--side", args.keyboard_side,
+        "--max-offset", str(args.keyboard_max_offset),
+        "--command-rate-hz", str(args.keyboard_command_rate_hz),
+        "--feedback-rate-hz", str(args.keyboard_feedback_rate_hz),
         "--log-level", args.log_level,
     ]
     return ChildSpec(label="keybd ", argv=argv)
@@ -217,8 +221,11 @@ def _vr_direct_teleop_spec(args: argparse.Namespace) -> ChildSpec:
         "--sim-host", args.sim_host,
         "--sim-pub-port", str(args.sim_port),
         "--sim-pull-port", str(args.sim_pull_port),
+        "--sim-rep-port", str(args.sim_rep_port),
         "--robot-id", str(args.sim_robot_id),
         "--side", args.vr_side,
+        "--rate-hz", str(args.vr_rate_hz),
+        "--feedback-rate-hz", str(args.vr_feedback_rate_hz),
         "--position-scale", str(args.vr_position_scale),
         "--grip-threshold", str(args.vr_grip_threshold),
         "--log-level", args.log_level,
@@ -342,6 +349,7 @@ def main() -> int:
     g_sim.add_argument("--sim-host", default="100.80.87.68")
     g_sim.add_argument("--sim-port", type=int, default=5555)
     g_sim.add_argument("--sim-pull-port", type=int, default=5556)
+    g_sim.add_argument("--sim-rep-port", type=int, default=5557)
     g_sim.add_argument("--sim-robot-id", type=int, default=0)
     g_sim.add_argument("--sim-topic", default="rgb.front",
                        help="rgb.front | rgb.wrist")
@@ -351,11 +359,16 @@ def main() -> int:
     g_keyboard.add_argument("--keyboard-host", default="127.0.0.1")
     g_keyboard.add_argument("--keyboard-port", type=int, default=8765)
     g_keyboard.add_argument("--keyboard-side", choices=["right", "left"], default="right")
+    g_keyboard.add_argument("--keyboard-max-offset", type=float, default=0.80)
+    g_keyboard.add_argument("--keyboard-command-rate-hz", type=float, default=90.0)
+    g_keyboard.add_argument("--keyboard-feedback-rate-hz", type=float, default=90.0)
     # ── direct VR arm bridge 인자 ────────────────────────────────────────
     g_vr = p.add_argument_group("vr_direct_teleop (--vr-direct-teleop)")
     g_vr.add_argument("--pose-host", default="127.0.0.1")
     g_vr.add_argument("--pose-port", type=int, default=7001)
     g_vr.add_argument("--vr-side", choices=["right", "left", "both"], default="right")
+    g_vr.add_argument("--vr-rate-hz", type=float, default=90.0)
+    g_vr.add_argument("--vr-feedback-rate-hz", type=float, default=90.0)
     g_vr.add_argument("--vr-position-scale", type=float, default=1.0)
     g_vr.add_argument("--vr-grip-threshold", type=float, default=0.5)
     # ── 공통 ───────────────────────────────────────────────────────────

@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import math
+import pathlib
 import ssl
 import time
 from dataclasses import dataclass
@@ -53,6 +56,10 @@ class ProbeConfig:
     open_delta: float
     close_threshold: float
     open_threshold: float
+    listen_s: float
+    pose_min_hz: float
+    pose_min_count_ratio: float
+    live_quest: bool
 
 
 def _ssl_unverified() -> ssl.SSLContext:
@@ -148,6 +155,44 @@ async def _send_ws_frames(
                 await asyncio.sleep(1.0 / 90.0)
 
 
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    pct = min(100.0, max(0.0, float(percentile)))
+    idx = math.ceil((pct / 100.0) * len(ordered)) - 1
+    idx = min(len(ordered) - 1, max(0, idx))
+    return ordered[idx]
+
+
+def _pose_stream_metrics(
+    recv_times_ns: list[int],
+    mac_to_sub_age_ms: list[float],
+) -> dict[str, Any]:
+    count = len(recv_times_ns)
+    span_s: float | None = None
+    observed_hz: float | None = None
+    if count >= 2:
+        span_s = (recv_times_ns[-1] - recv_times_ns[0]) / 1e9
+        if span_s > 0.0:
+            observed_hz = (count - 1) / span_s
+    return {
+        "count": count,
+        "recv_span_s": span_s,
+        "observed_hz": observed_hz,
+        "mac_to_sub_age_ms_avg": (
+            None
+            if not mac_to_sub_age_ms
+            else sum(mac_to_sub_age_ms) / len(mac_to_sub_age_ms)
+        ),
+        "mac_to_sub_age_ms_p95": _percentile(mac_to_sub_age_ms, 95.0),
+        "mac_to_sub_age_ms_max": (
+            None if not mac_to_sub_age_ms else max(mac_to_sub_age_ms)
+        ),
+        "age_samples": len(mac_to_sub_age_ms),
+    }
+
+
 async def _open_ws(cfg: ProbeConfig):
     url = f"wss://{cfg.mac_host}:{cfg.page_port}/ws?robot={cfg.robot_id}"
     ssl_ctx = _ssl_unverified()
@@ -186,24 +231,40 @@ async def probe_mac_pose(cfg: ProbeConfig) -> dict[str, Any]:
     sub = _open_sub(endpoint, topic)
     try:
         await asyncio.sleep(0.2)
-        task = asyncio.create_task(
-            _send_ws_frames(cfg, grip=cfg.grip, trigger=cfg.pose_trigger)
-        )
-        count = 0
+        task: asyncio.Task | None = None
+        if not cfg.live_quest:
+            task = asyncio.create_task(
+                _send_ws_frames(cfg, grip=cfg.grip, trigger=cfg.pose_trigger)
+            )
+        recv_times_ns: list[int] = []
+        mac_to_sub_age_ms: list[float] = []
         first: dict[str, Any] | None = None
-        deadline = time.monotonic() + max(2.0, cfg.frames / 60.0)
+        deadline = time.monotonic() + max(float(cfg.listen_s), cfg.frames / 60.0)
+        min_synthetic_count = max(10, int(cfg.frames * cfg.pose_min_count_ratio))
         while time.monotonic() < deadline:
             for topic_b, msg in _drain_sub(sub):
                 if topic_b != topic:
                     continue
-                count += 1
+                recv_ns = time.monotonic_ns()
+                recv_times_ns.append(recv_ns)
+                stamp_ns = msg.get("stamp_ns")
+                if isinstance(stamp_ns, int):
+                    age_ms = (recv_ns - stamp_ns) / 1e6
+                    if math.isfinite(age_ms) and age_ms >= 0.0:
+                        mac_to_sub_age_ms.append(age_ms)
                 if first is None:
                     first = msg
-            if task.done() and count >= cfg.frames:
+            if (
+                task is not None
+                and task.done()
+                and len(recv_times_ns) >= min_synthetic_count
+            ):
                 break
             await asyncio.sleep(0.005)
-        await task
-        return {"count": count, "first": first}
+        if task is not None:
+            await task
+        metrics = _pose_stream_metrics(recv_times_ns, mac_to_sub_age_ms)
+        return {"first": first, **metrics}
     finally:
         sub.close(linger=0)
 
@@ -389,6 +450,50 @@ async def probe_arm_via_bridge(cfg: ProbeConfig) -> dict[str, Any]:
     }
 
 
+async def probe_live_arm_motion(cfg: ProbeConfig) -> dict[str, Any]:
+    """Watch a live Quest/controller run and measure sim tf.links movement.
+
+    This mode does not inject synthetic WebSocket frames. It is intended for the
+    final physical-device gate: start the Quest page + bridge, run this probe,
+    grip the controller, and move the arm during the listen window.
+    """
+    ctx = zmq.Context.instance()
+    tf_sub = _open_tf_sub(ctx, cfg)
+    samples: list[list[float]] = []
+    try:
+        base = await _collect_latest_tf(tf_sub, 0.8)
+        if base is not None:
+            samples.append(base)
+        deadline = time.monotonic() + float(cfg.listen_s)
+        while time.monotonic() < deadline:
+            for pose in _drain_tf_ee(tf_sub):
+                if base is None:
+                    base = pose
+                samples.append(pose)
+            await asyncio.sleep(0.005)
+    finally:
+        tf_sub.close(linger=0)
+
+    max_move: float | None = None
+    moved_best: list[float] | None = None
+    if base is not None and samples:
+        scored = [(_xyz_dist(base, pose), pose) for pose in samples]
+        scored = [(d, p) for d, p in scored if d is not None]
+        if scored:
+            max_move, moved_best = max(scored, key=lambda item: item[0])
+    return {
+        "base": base,
+        "anchor": base,
+        "moved": moved_best,
+        "moved_best": moved_best,
+        "returned": None,
+        "max_move": max_move,
+        "return_dist": None,
+        "samples": len(samples),
+        "listen_s": cfg.listen_s,
+    }
+
+
 def _send_direct_gripper(
     ctx: zmq.Context,
     cfg: ProbeConfig,
@@ -434,6 +539,10 @@ def _fmt(v: float | None) -> str:
     return "None" if v is None else f"{v:.5f}"
 
 
+def _fmt_hz(v: float | None) -> str:
+    return "None" if v is None else f"{v:.2f}"
+
+
 def _fmt_xyz(pose: list[float] | None) -> str:
     if pose is None:
         return "None"
@@ -457,16 +566,45 @@ async def main_async(args: argparse.Namespace) -> int:
         open_delta=args.open_delta,
         close_threshold=args.close_threshold,
         open_threshold=args.open_threshold,
+        listen_s=args.listen_s,
+        pose_min_hz=args.pose_min_hz,
+        pose_min_count_ratio=args.pose_min_count_ratio,
+        live_quest=args.live_quest,
     )
+
+    summary: dict[str, Any] = {
+        "config": {
+            "mac_host": cfg.mac_host,
+            "sim_host": cfg.sim_host,
+            "robot_id": cfg.robot_id,
+            "frames": cfg.frames,
+            "listen_s": cfg.listen_s,
+            "pose_min_hz": cfg.pose_min_hz,
+            "pose_min_count_ratio": cfg.pose_min_count_ratio,
+            "live_quest": cfg.live_quest,
+        },
+        "arm": None,
+        "gripper": None,
+        "mac_pose": None,
+        "ok": False,
+    }
 
     ok_arm = True
     if not args.no_arm:
-        print("[1] arm path: Mac pose -> VR bridge -> sim tf.links")
-        arm = await probe_arm_via_bridge(cfg)
+        if cfg.live_quest:
+            print("[1] live arm path: Quest pose -> VR bridge -> sim tf.links")
+            print(
+                f"    move the gripped controller during the next {cfg.listen_s:.1f}s"
+            )
+            arm = await probe_live_arm_motion(cfg)
+        else:
+            print("[1] arm path: Mac pose -> VR bridge -> sim tf.links")
+            arm = await probe_arm_via_bridge(cfg)
         base = arm["base"]
         anchor = arm["anchor"]
         moved = arm["moved_best"] or arm["moved"]
         returned = arm["returned"]
+        summary["arm"] = arm
         print(f"    base_xyz={_fmt_xyz(base)}")
         print(f"    anchor_xyz={_fmt_xyz(anchor)} moved_xyz={_fmt_xyz(moved)}")
         print(
@@ -491,6 +629,11 @@ async def main_async(args: argparse.Namespace) -> int:
         closed = grip["closed"]
         opened_delta = None if base is None or opened is None else opened - base
         closed_delta = None if opened is None or closed is None else opened - closed
+        summary["gripper"] = {
+            **grip,
+            "opened_delta": opened_delta,
+            "closed_delta": closed_delta,
+        }
         print(
             f"    jaw base={_fmt(base)} opened={_fmt(opened)} closed={_fmt(closed)}"
         )
@@ -515,9 +658,24 @@ async def main_async(args: argparse.Namespace) -> int:
 
     print("[3] mac_proxy /ws -> ZMQ pose stream")
     mac = await probe_mac_pose(cfg)
+    summary["mac_pose"] = mac
     first = mac["first"] or {}
     right = first.get("right") or {}
-    print(f"    count={mac['count']} topic=pose.{cfg.robot_id}")
+    expected_count = (
+        cfg.pose_min_hz * cfg.listen_s if cfg.live_quest else float(cfg.frames)
+    )
+    min_count = max(10, int(expected_count * cfg.pose_min_count_ratio))
+    print(
+        f"    count={mac['count']} min_count={min_count} "
+        f"observed_hz={_fmt_hz(mac['observed_hz'])} "
+        f"min_hz={cfg.pose_min_hz:.1f} topic=pose.{cfg.robot_id}"
+    )
+    print(
+        "    mac_to_sub_age_ms="
+        f"avg={_fmt(mac['mac_to_sub_age_ms_avg'])} "
+        f"p95={_fmt(mac['mac_to_sub_age_ms_p95'])} "
+        f"max={_fmt(mac['mac_to_sub_age_ms_max'])}"
+    )
     print(
         "    first="
         f"schema={first.get('schema')!r} robot_id={first.get('robot_id')} "
@@ -526,7 +684,9 @@ async def main_async(args: argparse.Namespace) -> int:
         f"right.grip={right.get('grip')} right.trigger={right.get('trigger')}"
     )
     ok_mac = (
-        mac["count"] >= max(10, cfg.frames // 2)
+        mac["count"] >= min_count
+        and mac["observed_hz"] is not None
+        and mac["observed_hz"] >= cfg.pose_min_hz
         and first.get("schema") == "xlerobot_v1.1.page"
         and first.get("robot_id") == cfg.robot_id
         and first.get("frame") == "local-floor"
@@ -541,6 +701,12 @@ async def main_async(args: argparse.Namespace) -> int:
 
     ok = ok_mac and ok_open and ok_close
     ok = ok and ok_arm
+    summary["ok"] = ok
+    if args.summary_json:
+        path = pathlib.Path(args.summary_json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+        print(f"summary_json={path}")
     print("PASS" if ok else "FAIL")
     return 0 if ok else 3
 
@@ -557,6 +723,24 @@ def main() -> int:
     p.add_argument("--sim-pub-port", type=int, default=5555)
     p.add_argument("--sim-pull-port", type=int, default=5556)
     p.add_argument("--frames", type=int, default=90)
+    p.add_argument(
+        "--listen-s",
+        type=float,
+        default=5.0,
+        help="listen window for live Quest checks and pose ZMQ rate measurement",
+    )
+    p.add_argument(
+        "--pose-min-hz",
+        type=float,
+        default=80.0,
+        help="minimum observed pose.<robot_id> ZMQ rate for PASS",
+    )
+    p.add_argument(
+        "--pose-min-count-ratio",
+        type=float,
+        default=0.75,
+        help="minimum received pose frame ratio relative to expected count",
+    )
     p.add_argument("--grip", type=float, default=1.0)
     p.add_argument(
         "--pose-trigger",
@@ -594,7 +778,18 @@ def main() -> int:
         action="store_true",
         help="skip gripper trigger-close verification",
     )
+    p.add_argument(
+        "--live-quest",
+        action="store_true",
+        help="do not inject synthetic /ws frames; listen to an already running Quest page",
+    )
+    p.add_argument(
+        "--summary-json",
+        help="write a structured acceptance summary JSON artifact",
+    )
     args = p.parse_args()
+    if args.live_quest and args.gripper:
+        p.error("--gripper uses synthetic trigger frames; use it without --live-quest")
     return asyncio.run(main_async(args))
 
 

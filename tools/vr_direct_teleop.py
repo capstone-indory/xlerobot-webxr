@@ -18,6 +18,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +32,7 @@ from teleop_common import (
     clamp_pose_to_workspace,
     extract_tf_poses,
     pack_command,
+    rpc_request,
     unpack_payload,
 )
 
@@ -168,7 +170,9 @@ class DirectVrBridge:
         self.sim_sub.setsockopt(zmq.SUBSCRIBE, f"tf.links.{self.args.robot_id}".encode())
 
         self.push = self.ctx.socket(zmq.PUSH)
-        self.push.setsockopt(zmq.SNDHWM, 8)
+        self.push.setsockopt(zmq.SNDHWM, 1)
+        self.push.setsockopt(zmq.SNDTIMEO, 0)
+        self.push.setsockopt(zmq.IMMEDIATE, 1)
         self.push.setsockopt(zmq.LINGER, 0)
         self.push.connect(f"tcp://{self.args.sim_host}:{self.args.sim_pull_port}")
         log.info(
@@ -178,6 +182,7 @@ class DirectVrBridge:
             self.args.sim_host,
             self.args.sim_pull_port,
         )
+        self._configure_feedback_streams()
 
         if self.args.record:
             self.args.record.parent.mkdir(parents=True, exist_ok=True)
@@ -189,6 +194,40 @@ class DirectVrBridge:
                 sock.close(linger=0)
         if self.record_fh is not None:
             self.record_fh.close()
+
+    def _configure_feedback_streams(self) -> None:
+        rate_hz = float(self.args.feedback_rate_hz)
+        if rate_hz <= 0.0:
+            return
+        for topic in (
+            f"tf.links.{self.args.robot_id}",
+            f"proprio.{self.args.robot_id}",
+        ):
+            try:
+                reply = rpc_request(
+                    self.args.sim_host,
+                    self.args.sim_rep_port,
+                    "set_stream_rate",
+                    topic=topic,
+                    rate_hz=rate_hz,
+                    timeout_ms=500,
+                )
+            except Exception as exc:
+                log.warning(
+                    "could not set %s feedback stream to %.1f Hz: %s",
+                    topic,
+                    rate_hz,
+                    exc,
+                )
+                continue
+            if reply.get("ok") is True:
+                log.info("set %s feedback stream to %.1f Hz", topic, rate_hz)
+            else:
+                log.warning(
+                    "sim rejected feedback rate for %s: %s",
+                    topic,
+                    reply.get("error"),
+                )
 
     def drain(self) -> None:
         if self.sim_sub is not None:
@@ -415,8 +454,21 @@ class DirectVrBridge:
         rel: dict[str, dict[str, float]],
     ) -> None:
         assert self.push is not None
-        payload = build_command_payload(self.args.robot_id, targets, rel)
-        self.push.send(pack_command(payload))
+        payload = build_command_payload(
+            self.args.robot_id,
+            targets,
+            rel,
+            source_id=self.args.source_id,
+            source_role=self.args.source_role,
+            priority=self.args.priority,
+            lease_ms=self.args.lease_ms,
+        )
+        try:
+            self.push.send(pack_command(payload), flags=zmq.NOBLOCK)
+        except zmq.Again:
+            # Teleop streams are freshness-oriented. If the sim-side PULL queue
+            # is full, the next tick will carry a newer target.
+            pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -430,9 +482,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sim-host", default="100.80.87.68")
     parser.add_argument("--sim-pub-port", type=int, default=5555)
     parser.add_argument("--sim-pull-port", type=int, default=5556)
+    parser.add_argument("--sim-rep-port", type=int, default=5557)
     parser.add_argument("--robot-id", type=int, default=0)
     parser.add_argument("--side", choices=["right", "left", "both"], default="right")
-    parser.add_argument("--rate-hz", type=float, default=60.0)
+    parser.add_argument("--rate-hz", type=float, default=90.0)
     parser.add_argument("--position-scale", type=float, default=1.0)
     parser.add_argument("--grip-threshold", type=float, default=0.5)
     parser.add_argument("--gripper-per-tick", type=float, default=0.01)
@@ -442,9 +495,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--synthetic-period-s", type=float, default=3.0)
     parser.add_argument("--duration-s", type=float, default=0.0)
     parser.add_argument("--min-move", type=float, default=0.002)
+    parser.add_argument("--feedback-rate-hz", type=float, default=90.0)
+    parser.add_argument("--source-id", default=None)
+    parser.add_argument(
+        "--source-role",
+        choices=("teleop", "policy", "safety", "script"),
+        default="teleop",
+    )
+    parser.add_argument("--priority", type=int, default=10)
+    parser.add_argument("--lease-ms", type=int, default=1000)
     parser.add_argument("--record", type=Path, default=None)
     parser.add_argument("--log-level", default="INFO")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.source_id is None:
+        args.source_id = f"vr-direct:{args.robot_id}:{os.getpid()}"
+    return args
 
 
 def main() -> int:
