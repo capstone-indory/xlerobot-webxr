@@ -154,7 +154,8 @@ python3 tools/teleop_probe.py \
   --mac-host <mac-tailscale-ip> \
   --sim-host 127.0.0.1 \
   --robot-id 0 \
-  --gripper
+  --gripper \
+  --summary-json /tmp/xlerobot-teleop-probe.json
 ```
 
 `--gripper` 는 sim Jaw 를 직접 한 번 열어 둔 뒤 Mac trigger payload 가 VR bridge 를 통해
@@ -162,6 +163,29 @@ Jaw 를 다시 닫는지 측정한다. `direct open` 은 되는데 `trigger clos
 proxy 가 아니라 Home Server bridge 실행, `estop`, `right.grip`, 또는 trigger→gripper
 sign/slot 쪽을 본다. 초기 Jaw 가 이미 닫혀 있으면 trigger close 만으로는 눈에 띄는
 변화가 없으므로 gripper 검증은 반드시 먼저 열어 둔 상태에서 해석한다.
+
+실제 Quest Browser/WebXR session 이 이미 Mac proxy 에 붙어 있고 Home Server bridge 가
+`--source zmq` 로 실행 중이면, synthetic payload 대신 live pose stream 을 직접 측정한다.
+probe 를 실행한 뒤 표시되는 listen window 동안 controller grip 을 누른 채 팔을 움직인다:
+
+```bash
+python3 tools/teleop_probe.py \
+  --mac-host <mac-tailscale-ip> \
+  --sim-host 127.0.0.1 \
+  --robot-id 0 \
+  --live-quest \
+  --listen-s 5 \
+  --pose-min-hz 80 \
+  --arm-threshold 0.10 \
+  --no-gripper \
+  --summary-json /tmp/xlerobot-live-quest-acceptance.json
+```
+
+이 live mode 는 synthetic `/ws` frame 을 주입하지 않는다. `pose.<robot_id>` ZMQ stream 의
+count, observed Hz, Mac-publish-to-subscriber age, schema/robot/frame, 그리고 같은 시간대의
+sim `tf.links` 최대 이동량을 기록한다. 최종 Quest acceptance 는 JSON artifact 와 함께
+`observed_hz` 가 90Hz 근처인지, `max_move` 가 의도한 controller motion 만큼 나왔는지,
+Home Server `stream_status` 가 90Hz control stream 을 유지했는지를 같이 본다.
 
 ### 3. 비디오 소스 — 세 가지 중 하나 선택
 
@@ -258,8 +282,9 @@ python3 tools/run.py \
 이 모드는 `mac_proxy.py`가 `pose.<robot_id>`를 publish하고,
 `tools/vr_direct_teleop.py`가 그 pose를 SUB해서 sim `:5556`으로 직접 PUSH한다.
 오른쪽 grip을 0.5 이상 잡은 첫 frame에서 anchor를 캡처하고, 이후 controller 위치
-delta를 기본 1:1 scale로 EE target delta로 변환한다. 미세 조작이 필요하면
-`--vr-position-scale 0.5` 또는 `tools/vr_direct_teleop.py --position-scale 0.5`로 낮춘다.
+delta를 기본 1:1 scale로 EE target delta로 변환한다. WebXR page의 pose 송신과 direct
+bridge의 sim PUSH는 기본 90Hz로 맞춰져 있다. 미세 조작이 필요하면 `--vr-position-scale 0.5`
+또는 `tools/vr_direct_teleop.py --position-scale 0.5`로 낮춘다.
 Quest 없이 bridge 자체만 확인할 때는 synthetic
 pose source로 sim arm 이동량을 바로 측정한다:
 
@@ -281,27 +306,80 @@ W/S/R/F jog 입력을 `xlerobot_v1.1 arm_ee_pose_target`으로 변환해 sim `:5
 python3 tools/run.py \
   --keyboard-teleop \
   --sim-host 100.80.87.68 \
+  --sim-port 5555 \
+  --sim-pull-port 5556 \
+  --sim-rep-port 5557 \
   --sim-robot-id 0
 ```
 
 브라우저에서 `http://127.0.0.1:8765/?robot=0`을 열면 키보드 입력만으로 오른팔
-EE target이 움직인다. 기본 tap nudge는 `step=0.08`m이고, 키를 누르고 있으면
-브라우저 key-repeat을 기다리지 않고 `speed=0.50`m/s로 매 frame nudge를 누적한다.
+EE target이 움직인다. 기본 tap nudge는 `step=0.10`m이고, 키를 누르고 있으면
+브라우저 key-repeat을 기다리지 않고 `speed=0.80`m/s로 매 frame nudge를 누적한다.
 W/S는 위/아래, R/F는 앞/뒤 EE target nudge, A/D는 shoulder pan, Z/X는 gripper
 delta다. EE nudge는 `tf.links.<robot_id>`에서 잡은 anchor 기준 offset으로 누적되고,
-기본 `--max-offset 0.30`m 범위와 sim EE reach sphere 안쪽으로 clamp된다.
+기본 `--max-offset 0.80`m 범위와 sim EE reach sphere 안쪽으로 clamp된다.
+Home Server decoder는 이후 URDF joint-limited workspace projection을 한 번 더 적용하므로,
+sphere 안쪽이지만 실제로는 닿지 않는 target은 reachable xyz로 투영된다. realtime 경로는
+operator가 민 방향을 최대한 보존하고, 같은 방향으로 충분히 전진하는 direct solve가 있으면
+`best_effort_directional` projection으로 물리 workspace 경계까지 보낸다.
+현재 joint seed가 local minimum에 걸리면 Home Server가 cached FK seed cloud 기반
+multi-start refinement를 수행하므로, 이 repo의 browser/Mac 도구는 별도 IK solver를
+두지 않는다. Home Server action term은 같은 position-only solver의 joint solution을
+articulation target으로 적용하므로, browser/Mac 쪽은 anchor-relative EE target을 계속
+보내는 책임만 가진다. Home Server VR-mode는 arm self-collision을 꺼서 SRDF상 허용된
+arm fold가 USD/PhysX collision에 막히지 않게 한다.
+`tools/run.py --keyboard-teleop`는 `--sim-rep-port`도 전달하므로 custom sim port
+세트에서도 `tf.links`/`proprio` feedback stream을 90Hz로 올리는 RPC가 올바른 서버에
+도달한다. 필요하면 `--keyboard-feedback-rate-hz 0`으로 이 자동 설정을 끌 수 있다.
 브라우저 전송 loop는 `requestAnimationFrame`으로 계속 돌며 `hz` query 값으로만
-throttle한다. 입력 직후에는 서버가 최신 EE target을 기본 5초 동안 60Hz로 유지 송신한다. sim은
-PULL 큐를 최신 명령 위주로 처리하지만, 실제 EE pose target은 짧은 one-shot보다
-몇 초간 유지 송신할 때 안정적으로 반영된다.
+throttle한다. 기본 `hz=90`이라 Quest/WebXR 90Hz cadence와 맞고, 60Hz 화면에서는
+display frame rate까지 자연스럽게 내려간다. 물리 키보드의 첫 `keydown`과 `keyup`은
+rAF tick을 기다리지 않고 즉시 WebSocket command를 보낸다. 입력 직후 active motion은 최신
+EE target을 보내지만, zero-motion/idle 상태는 full EE target을 반복 송신하지 않고 stateless
+hold heartbeat를 보낸다. 이렇게 해야 overreach target을 90Hz로 반복 projection하지 않고,
+Home Server의 same-batch merge가 직전 tap nudge를 hold heartbeat에 의해 잃지 않는다. sim은
+PULL 큐를 최신 명령 위주로 처리하고, active nudge/held-key command는 최신 target을 즉시
+반영한다. hold/prime heartbeat는 source metadata를 붙이지 않으므로 active motion이 끝난 뒤
+keyboard teleop lease를 계속 갱신하지 않는다. active lease가 살아있는 동안에는 zero-hold
+heartbeat도 생략하고, 이후 background hold heartbeat는 최대 5Hz로 제한된다.
 버튼은 JS pointer/keyboard handler가 실패해도 같은 동작을 `POST /api/nudge`
-form fallback으로 보낸다. 이 경로는 WebXR session, Quest, WebRTC video,
-VR bridge를 시작하지 않는다.
+form fallback으로 보낸다. `/api/nudge`는 첫 command를 즉시 보낸 뒤 HTTP 응답을
+반환하고, 이후 background loop는 low-rate source-free hold heartbeat만 맡는다. 이 경로는
+WebXR session, Quest, WebRTC video, VR bridge를 시작하지 않는다.
+
+latency를 분리해서 보려면 HTTP fallback은 `tools/keyboard_latency_probe.py`, 실제
+physical-key WebSocket 경로는 `tools/keyboard_ws_latency_probe.py`로 측정한다. 최신
+Home Server가 `tf.links.<robot_id>.vr_decode_debug`를 publish하면 두 probe는 sim-side
+workspace projection 요약도 함께 출력한다. `cmd_echo_stamp_ns`가 있으면
+`first_cmd_echo_ms`도 출력하므로 command publish latency와 첫 EE motion latency를 분리해서
+볼 수 있다. `keyboard_ws_latency_probe.py --hold-s 0.5 --speed 0.8`처럼 실행하면
+브라우저에서 키를 누르고 있는 동안의 rAF nudge cadence와 누적 delta도 확인할 수 있다.
+이 held-key summary는 requested movement와 decoder-projected target movement를 분리해서
+출력하므로, workspace 경계에서 정상적으로 잘린 경우와 실제 tracking underreach를 구분한다.
+테스트는 embedded browser script의 rAF callback도 실행해서, 키를 누르고 있는 동안
+OS key-repeat 없이 `speed * dt` nudge가 계속 생성되는지 검증한다. keyup 이후에는 한 번의
+zero edge만 보내고, rAF loop가 90Hz idle zero frame을 계속 보내지 않는다.
+keyboard/VR direct PUSH 경로는 freshness 우선으로 `SNDHWM=1`, `SNDTIMEO=0`,
+`IMMEDIATE=1`, non-blocking send를 사용한다. mac_proxy의 `pose.<robot_id>` ZMQ PUB도
+`SNDHWM=1`, `SNDTIMEO=0`, non-blocking send라 Quest controller pose가 밀릴 때 오래된
+pose를 쌓지 않는다. sim PULL 또는 pose subscriber 쪽이 순간적으로 밀리면 오래된 frame을
+기다리지 않고 drop하고 다음 tick의 최신 target/pose를 보낸다.
+`tools/keyboard_teleop.py`와 `tools/vr_direct_teleop.py`는 시작 시 Home Server RPC로
+`tf.links.<robot_id>`와 `proprio.<robot_id>`를 기본 90Hz로 올린다. sim default profile의
+30Hz feedback cadence를 의도적으로 유지하려면 `--feedback-rate-hz 0`을 넘긴다.
+그래도 90Hz처럼 보이지 않으면 Home Server의 `stream_status` RPC에서
+`observed_loop_hz`, `avg_env_step_ms`, topic별 `rate_hz_target`을 먼저 확인한다.
+과거에는 `RateLimiter`가 작은 sleep overshoot를 매번 missed tick으로 처리해 nominal
+90Hz 서버가 실제 45Hz로 도는 문제가 있었다.
+Camera-enabled teleop 검증은 Home Server를 `--profile teleop --rate-hz 90 --enable_cameras`
+로 띄우고 봐야 한다. 이 profile은 `tf.links`/`proprio` 90Hz, RGB 15Hz, depth/lidar disabled
+구성이라 키보드/WebXR control feedback을 먼저 보장한다.
 
 같은 `robot_id`에 여러 teleop/bridge 프로세스나 오래 열린 브라우저 탭이 동시에
-명령을 보내면 sim의 last-writer-wins 정책 때문에 서로 target을 덮어쓴다. 지연처럼
-보이거나 움직임이 끊기면 먼저 `pgrep -fl 'keyboard_teleop|vr_direct_teleop|tools/run.py'`
-로 중복 writer를 확인한다.
+명령을 보내면 Home Server의 command-source lease arbitration이 lower/same-priority
+writer를 drop한다. 그래도 지연처럼 보이거나 움직임이 끊기면 먼저
+`pgrep -fl 'keyboard_teleop|vr_direct_teleop|tools/run.py'`로 중복 writer를 확인하고,
+Home Server `command_status`에서 `active_source_id`와 `last_rejected_reason`을 본다.
 
 동일 서버를 단독 스크립트로 직접 띄우려면:
 
@@ -356,7 +434,7 @@ python3 tools/ee_target_verify.py \
 | (a) | Mac proxy 가 양 인터페이스 host candidate publish | `mac_proxy.py` 기동 로그에 en0 + utun 둘 다 enumerate. `fake_producer.py` 가 동일 호스트에서 붙고 connection state 가 `connected` |
 | (b) | mac ↔ server end-to-end <10ms (가짜 producer) | `fake_producer.py` 가 mac_proxy 와 localhost 통신 시 트랙 도착까지 1초 미만, RTP 흐름 안정 |
 | (c) | `?robot=N` 라우팅 | Quest 페이지에서 `?robot=2` 로 접속 후 mac_proxy 로그에 `pose ws[xxx] robot_id 0 -> 2`. `zmq` SUB 로 `b"pose.2"` 토픽 확인 |
-| (d) | pose ZMQ PUB 90Hz | 별도 sub 클라이언트로 토픽 SUB 시 5초 평균 ~90Hz |
+| (d) | pose ZMQ PUB 90Hz | `tools/teleop_probe.py --live-quest --listen-s 5 --pose-min-hz 80 --summary-json ...` 또는 synthetic mode 로 `observed_hz` 확인 |
 
 ## M0b 통과 기준 (§8 row "0b")
 

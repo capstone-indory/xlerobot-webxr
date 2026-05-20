@@ -241,11 +241,15 @@ class ZMQPosePublisher:
         self.addr = addr
         self.ctx = zmq.asyncio.Context.instance()
         self.sock: Optional[zmq.asyncio.Socket] = None
+        self.send_drops = 0
 
     async def start(self) -> None:
         self.sock = self.ctx.socket(zmq.PUB)
-        # PUB 의 send 가 비동기에서 막히지 않도록 SNDHWM 작게.
-        self.sock.set_hwm(100)
+        # Controller pose is a live measurement. If a subscriber falls behind,
+        # drop stale poses instead of queueing old controller positions.
+        self.sock.setsockopt(zmq.SNDHWM, 1)
+        self.sock.setsockopt(zmq.SNDTIMEO, 0)
+        self.sock.setsockopt(zmq.LINGER, 0)
         self.sock.bind(self.addr)
         log.info("zmq PUB bound: %s", self.addr)
         # PUB-SUB slow-joiner: subscriber 가 늦게 붙으면 초기 메시지를 놓침.
@@ -274,7 +278,12 @@ class ZMQPosePublisher:
             "estop": bool(payload.get("estop", False)),
         }
         try:
-            await self.sock.send_multipart([topic, msgpack.packb(body, use_bin_type=True)])
+            await self.sock.send_multipart(
+                [topic, msgpack.packb(body, use_bin_type=True)],
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.Again:
+            self.send_drops += 1
         except zmq.ZMQError as e:
             log.warning("zmq publish failed: %s", e)
 

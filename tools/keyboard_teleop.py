@@ -39,6 +39,7 @@ from teleop_common import (
     clamp_pose_to_workspace,
     extract_tf_poses,
     pack_command,
+    rpc_request,
     unpack_payload,
 )
 
@@ -46,9 +47,10 @@ from teleop_common import (
 log = logging.getLogger("keyboard_teleop")
 
 DEFAULT_ROBOT_ID = 0
-DEFAULT_STEP_M = 0.080
-DEFAULT_SPEED_MPS = 0.500
-DEFAULT_MAX_OFFSET_M = 0.300
+DEFAULT_STEP_M = 0.100
+DEFAULT_SPEED_MPS = 0.800
+DEFAULT_MAX_OFFSET_M = 0.800
+ZERO_HOLD_HEARTBEAT_HZ = 5.0
 
 
 HTML = r"""<!doctype html>
@@ -159,10 +161,10 @@ HTML = r"""<!doctype html>
 <script>
 const query = new URLSearchParams(location.search);
 const robotId = Number.parseInt(query.get("robot") || "0", 10);
-const sendHz = Number.parseFloat(query.get("hz") || "60");
-const stepM = Number.parseFloat(query.get("step") || "0.080");
-const speedMps = Number.parseFloat(query.get("speed") || "0.500");
-const maxOffset = Number.parseFloat(query.get("max_offset") || "0.300");
+const sendHz = Number.parseFloat(query.get("hz") || "90");
+const stepM = Number.parseFloat(query.get("step") || "0.100");
+const speedMps = Number.parseFloat(query.get("speed") || "0.800");
+const maxOffset = Number.parseFloat(query.get("max_offset") || "0.800");
 const panStep = Number.parseFloat(query.get("pan_step") || "0.050");
 const gripStep = Number.parseFloat(query.get("grip_step") || "0.010");
 const maxPan = Number.parseFloat(query.get("max_pan") || "0.700");
@@ -303,6 +305,15 @@ function gripperDelta() {
   if (pressed.has("KeyX")) delta += gripStep;
   return delta;
 }
+function hasHeldCommand() {
+  for (const code of ["KeyW","KeyS","KeyR","KeyF","KeyA","KeyD","KeyZ","KeyX"]) {
+    if (pressed.has(code)) return true;
+  }
+  return false;
+}
+function hasPendingCommand() {
+  return estop || reanchor || queuedNudge.some(v => v !== 0) || hasHeldCommand();
+}
 function sendCommand(dt = 0) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const nudge = queuedNudge.slice();
@@ -342,7 +353,7 @@ function loop(now) {
   const renderDt = Math.min(0.05, Math.max(0.001, (now - lastRenderTick) / 1000));
   lastRenderTick = now;
   const sendPeriodMs = 1000 / Math.max(1, sendHz);
-  if (now - lastSendTick >= sendPeriodMs - 1.0) {
+  if (now - lastSendTick >= sendPeriodMs - 1.0 && hasPendingCommand()) {
     const sendDt = Math.min(0.05, Math.max(0.001, (now - lastSendTick) / 1000));
     lastSendTick = now;
     sendCommand(sendDt);
@@ -362,32 +373,50 @@ window.addEventListener("keydown", (e) => {
   if (["Space","KeyW","KeyA","KeyS","KeyD","KeyR","KeyF","KeyZ","KeyX","Digit0"].includes(code)) {
     e.preventDefault();
   }
+  let shouldSend = false;
   if (code === "Space") {
     active = !active;
     pressed.add(code);
     lastInput = code;
+    shouldSend = !e.repeat;
   } else if (code === "Escape") {
     estop = true;
     lastInput = code;
+    shouldSend = !e.repeat;
   } else if (code === "Digit0") {
     reanchor = true;
     targetOffset[0] = 0; targetOffset[1] = 0; targetOffset[2] = 0;
     pressed.add(code);
     lastInput = code;
+    shouldSend = !e.repeat;
   } else if (motionKeys.has(code)) {
-    if (!pressed.has(code) && !e.repeat) queueNudge(code);
+    if (!pressed.has(code) && !e.repeat) {
+      queueNudge(code);
+      shouldSend = true;
+    }
     pressed.add(code);
     active = true;
     lastInput = code || lastInput;
+  } else if (["KeyA","KeyD","KeyZ","KeyX"].includes(code)) {
+    pressed.add(code);
+    active = true;
+    lastInput = code || lastInput;
+    shouldSend = !e.repeat;
   } else {
     pressed.add(code);
-    active = true;
-    lastInput = code || lastInput;
+  }
+  if (shouldSend) {
+    sendCommand(0);
+    lastSendTick = performance.now();
+    render();
   }
 });
 window.addEventListener("keyup", (e) => {
   pressed.delete(e.code);
   if (!pressed.size) lastInput = "idle";
+  sendCommand(0);
+  lastSendTick = performance.now();
+  render();
 });
 window.addEventListener("blur", () => pressed.clear());
 $("activeBtn").onclick = () => { active = !active; lastInput = "stream"; };
@@ -454,6 +483,7 @@ class Config:
     sim_host: str
     sim_pub_port: int
     sim_pull_port: int
+    sim_rep_port: int
     robot_id: int
     side: str
     anchor_timeout_s: float
@@ -462,6 +492,11 @@ class Config:
     max_offset_m: float
     command_rate_hz: float
     maintain_s: float
+    feedback_rate_hz: float
+    source_id: str
+    source_role: str
+    priority: int
+    lease_ms: int
 
 
 @dataclass
@@ -508,11 +543,16 @@ class DirectSimTeleop:
             side: [0.0, 0.0, 0.0] for side in ARM_SIDES
         }
         self.stream_until_s = 0.0
+        self.source_lease_until_s = 0.0
         self.last_send_ns = 0
+        self.send_drops = 0
+        self.last_drop_ns = 0
 
     def start(self) -> None:
         self.push = self.ctx.socket(zmq.PUSH)
-        self.push.setsockopt(zmq.SNDHWM, 8)
+        self.push.setsockopt(zmq.SNDHWM, 1)
+        self.push.setsockopt(zmq.SNDTIMEO, 0)
+        self.push.setsockopt(zmq.IMMEDIATE, 1)
         self.push.setsockopt(zmq.LINGER, 0)
         self.push.connect(f"tcp://{self.cfg.sim_host}:{self.cfg.sim_pull_port}")
 
@@ -528,6 +568,7 @@ class DirectSimTeleop:
             self.cfg.sim_host,
             self.cfg.sim_pull_port,
         )
+        self.configure_feedback_streams()
 
     def close(self) -> None:
         if self.push is not None:
@@ -574,6 +615,40 @@ class DirectSimTeleop:
             self.target_offsets[self.cfg.side] = [0.0, 0.0, 0.0]
             log.info("re-anchored %s to latest tf.links pose", self.cfg.side)
 
+    def configure_feedback_streams(self) -> None:
+        rate_hz = float(self.cfg.feedback_rate_hz)
+        if rate_hz <= 0.0:
+            return
+        for topic in (
+            f"tf.links.{self.cfg.robot_id}",
+            f"proprio.{self.cfg.robot_id}",
+        ):
+            try:
+                reply = rpc_request(
+                    self.cfg.sim_host,
+                    self.cfg.sim_rep_port,
+                    "set_stream_rate",
+                    topic=topic,
+                    rate_hz=rate_hz,
+                    timeout_ms=500,
+                )
+            except Exception as exc:
+                log.warning(
+                    "could not set %s feedback stream to %.1f Hz: %s",
+                    topic,
+                    rate_hz,
+                    exc,
+                )
+                continue
+            if reply.get("ok") is True:
+                log.info("set %s feedback stream to %.1f Hz", topic, rate_hz)
+            else:
+                log.warning(
+                    "sim rejected feedback rate for %s: %s",
+                    topic,
+                    reply.get("error"),
+                )
+
     async def prime(self, frames: int | None = None, interval_s: float | None = None) -> None:
         """Seed the sim IK slots with current EE poses before user motion.
 
@@ -592,7 +667,8 @@ class DirectSimTeleop:
                 await asyncio.sleep(sleep_s)
 
     async def maintain_loop(self) -> None:
-        sleep_s = 1.0 / max(self.cfg.command_rate_hz, 1.0)
+        heartbeat_hz = min(max(self.cfg.command_rate_hz, 1.0), ZERO_HOLD_HEARTBEAT_HZ)
+        sleep_s = 1.0 / heartbeat_hz
         hold = CommandState(active=True, mode="jog")
         while True:
             if self.anchor_ready and time.monotonic() < self.stream_until_s:
@@ -606,13 +682,19 @@ class DirectSimTeleop:
             self.reanchor()
         if state.estop or not state.active:
             self.stream_until_s = 0.0
-            await self._send_hold()
+            if not self._source_lease_active():
+                await self._send_hold()
             return
         if not self.anchor_ready:
             return
 
         if renew_stream and not state.is_zero_motion:
             self.stream_until_s = time.monotonic() + self.cfg.maintain_s
+
+        if state.is_zero_motion:
+            if not self._source_lease_active():
+                await self._send_hold()
+            return
 
         side = self.cfg.side
         targets = self._hold_targets()
@@ -624,7 +706,11 @@ class DirectSimTeleop:
             }
             for arm_side in targets.keys()
         }
-        await self._send_pose_target(targets, rel)
+        sent = await self._send_pose_target(targets, rel)
+        if sent:
+            self.source_lease_until_s = (
+                time.monotonic() + max(0, int(self.cfg.lease_ms)) / 1000.0
+            )
 
     def _target_pose(self, state: CommandState) -> list[float]:
         side = self.cfg.side
@@ -687,12 +773,16 @@ class DirectSimTeleop:
         self,
         targets_by_side: dict[str, list[float]],
         rel: dict[str, dict[str, float]],
-    ) -> None:
+    ) -> bool:
         if self.push is None:
-            return
-        payload = build_command_payload(self.cfg.robot_id, targets_by_side, rel)
-        await self.push.send(pack_command(payload))
-        self.last_send_ns = payload["stamp_ns"]
+            return False
+        payload = build_command_payload(
+            self.cfg.robot_id,
+            targets_by_side,
+            rel,
+            **self._source_metadata(),
+        )
+        return await self._send_payload(payload)
 
     async def _send_pose_hold(self, sides: tuple[str, ...]) -> None:
         if self.push is None:
@@ -708,8 +798,7 @@ class DirectSimTeleop:
         if not targets:
             return
         payload = build_command_payload(self.cfg.robot_id, targets, rel)
-        await self.push.send(pack_command(payload))
-        self.last_send_ns = payload["stamp_ns"]
+        await self._send_payload(payload)
 
     async def _send_hold(self) -> None:
         if self.push is None:
@@ -720,8 +809,32 @@ class DirectSimTeleop:
                 self.cfg.side: {"shoulder_pan": 0.0, "gripper": 0.0}
             },
         )
-        await self.push.send(pack_command(payload))
-        self.last_send_ns = payload["stamp_ns"]
+        await self._send_payload(payload)
+
+    def _source_metadata(self) -> dict[str, Any]:
+        return {
+            "source_id": self.cfg.source_id,
+            "source_role": self.cfg.source_role,
+            "priority": self.cfg.priority,
+            "lease_ms": self.cfg.lease_ms,
+        }
+
+    def _source_lease_active(self) -> bool:
+        return time.monotonic() < self.source_lease_until_s
+
+    async def _send_payload(self, payload: dict[str, Any]) -> bool:
+        if self.push is None:
+            return False
+        try:
+            await self.push.send(pack_command(payload), flags=zmq.NOBLOCK)
+        except zmq.Again:
+            # Fresh teleop prefers dropping a stale frame over blocking the
+            # browser/WebSocket input handler behind a full PUSH queue.
+            self.send_drops += 1
+            self.last_drop_ns = time.monotonic_ns()
+            return False
+        self.last_send_ns = int(payload["stamp_ns"])
+        return True
 
 
 class WsHandler:
@@ -734,7 +847,6 @@ class WsHandler:
         await ws.prepare(request)
         peer = request.transport.get_extra_info("peername")
         log.info("keyboard ws connect from %s", peer)
-        await self.teleop.prime(frames=max(10, self.cfg.prime_frames // 2))
         status_task = asyncio.create_task(self._status_loop(ws))
         count = 0
         last = time.monotonic()
@@ -792,6 +904,8 @@ class WsHandler:
                     "side": self.cfg.side,
                     "anchor_ready": self.teleop.anchor_ready,
                     "last_send_ns": self.teleop.last_send_ns,
+                    "send_drops": self.teleop.send_drops,
+                    "source_id": self.cfg.source_id,
                     "ee_xyz": ee[:3] if isinstance(ee, list) and len(ee) >= 3 else None,
                 }
             )
@@ -829,6 +943,13 @@ async def health(request: web.Request) -> web.Response:
             "anchor_ready": teleop.anchor_ready,
             "all_anchors_ready": teleop.all_anchors_ready,
             "last_send_ns": teleop.last_send_ns,
+            "send_drops": teleop.send_drops,
+            "last_drop_ns": teleop.last_drop_ns,
+            "feedback_rate_hz": cfg.feedback_rate_hz,
+            "source_id": cfg.source_id,
+            "source_role": cfg.source_role,
+            "priority": cfg.priority,
+            "lease_ms": cfg.lease_ms,
             "latest_ee": teleop.latest_ee,
             "anchor_ee": teleop.anchor_ee,
             "target_offsets": teleop.target_offsets,
@@ -871,7 +992,7 @@ async def api_nudge(request: web.Request) -> web.Response:
         data = dict(await request.post())
     code = str(data.get("code") or request.query.get("code") or "")
     frames = int(float(data.get("frames") or request.query.get("frames") or 5))
-    hz = float(data.get("hz") or request.query.get("hz") or 60.0)
+    hz = float(data.get("hz") or request.query.get("hz") or 90.0)
     step_m = float(data.get("step") or request.query.get("step") or DEFAULT_STEP_M)
     pan_step = float(data.get("pan_step") or request.query.get("pan_step") or 0.050)
     grip_step = float(data.get("grip_step") or request.query.get("grip_step") or 0.010)
@@ -890,12 +1011,7 @@ async def api_nudge(request: web.Request) -> web.Response:
             {"ok": False, "error": "unsupported_code", "code": code},
             status=400,
         )
-    sleep_s = 1.0 / hz
     await teleop.send(state)
-    hold = CommandState(active=True, mode="jog")
-    for _ in range(frames - 1):
-        await teleop.send(hold)
-        await asyncio.sleep(sleep_s)
 
     accepts = request.headers.getall("Accept", [])
     if any("text/html" in value for value in accepts):
@@ -972,6 +1088,7 @@ def main() -> int:
     parser.add_argument("--sim-host", default=DEFAULT_SIM_HOST)
     parser.add_argument("--sim-pub-port", type=int, default=5555)
     parser.add_argument("--sim-pull-port", type=int, default=5556)
+    parser.add_argument("--sim-rep-port", type=int, default=5557)
     parser.add_argument("--robot-id", type=int, default=DEFAULT_ROBOT_ID)
     parser.add_argument("--side", choices=ARM_SIDES, default="right")
     parser.add_argument("--anchor-timeout", type=float, default=3.0)
@@ -996,14 +1113,43 @@ def main() -> int:
     parser.add_argument(
         "--command-rate-hz",
         type=float,
-        default=60.0,
-        help="Background EE target maintain rate after a nudge.",
+        default=90.0,
+        help="Maximum background zero-hold heartbeat rate after a nudge.",
     )
     parser.add_argument(
         "--maintain-s",
         type=float,
         default=5.0,
-        help="Seconds to keep streaming the latest EE target after each input.",
+        help="Seconds to emit source-free zero-hold heartbeats after each input.",
+    )
+    parser.add_argument(
+        "--feedback-rate-hz",
+        type=float,
+        default=90.0,
+        help="Set sim tf.links/proprio feedback stream rate at startup; <=0 disables.",
+    )
+    parser.add_argument(
+        "--source-id",
+        default=None,
+        help="Command source id used by sim-side lease arbitration.",
+    )
+    parser.add_argument(
+        "--source-role",
+        choices=("teleop", "policy", "safety", "script"),
+        default="teleop",
+        help="Command source role used by sim-side lease arbitration.",
+    )
+    parser.add_argument(
+        "--priority",
+        type=int,
+        default=10,
+        help="Command source priority; higher priority can take over an active lease.",
+    )
+    parser.add_argument(
+        "--lease-ms",
+        type=int,
+        default=1000,
+        help="Command source lease duration refreshed by active commands.",
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
@@ -1017,6 +1163,7 @@ def main() -> int:
         sim_host=args.sim_host,
         sim_pub_port=args.sim_pub_port,
         sim_pull_port=args.sim_pull_port,
+        sim_rep_port=args.sim_rep_port,
         robot_id=args.robot_id,
         side=args.side,
         anchor_timeout_s=args.anchor_timeout,
@@ -1025,6 +1172,11 @@ def main() -> int:
         max_offset_m=args.max_offset,
         command_rate_hz=args.command_rate_hz,
         maintain_s=args.maintain_s,
+        feedback_rate_hz=args.feedback_rate_hz,
+        source_id=args.source_id or f"keyboard:{args.host}:{args.port}:robot{args.robot_id}",
+        source_role=args.source_role,
+        priority=args.priority,
+        lease_ms=args.lease_ms,
     )
     try:
         asyncio.run(run(cfg))
