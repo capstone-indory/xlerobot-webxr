@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import math
+import pathlib
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -51,6 +52,28 @@ DEFAULT_STEP_M = 0.100
 DEFAULT_SPEED_MPS = 0.800
 DEFAULT_MAX_OFFSET_M = 0.800
 ZERO_HOLD_HEARTBEAT_HZ = 5.0
+DEFAULT_CONFIG = pathlib.Path(__file__).resolve().parent / "config.json"
+
+
+def _load_config(path: pathlib.Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"failed to read config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"config must be a JSON object: {path}")
+    return data
+
+
+def _get_nested(config: dict[str, Any], path: str, default: Any) -> Any:
+    cur: Any = config
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
 
 
 HTML = r"""<!doctype html>
@@ -1080,75 +1103,83 @@ async def run(cfg: Config) -> None:
 
 
 def main() -> int:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=str(DEFAULT_CONFIG))
+    pre_args, _ = pre.parse_known_args()
+    config_path = pathlib.Path(pre_args.config).expanduser()
+    config = _load_config(config_path)
+
     parser = argparse.ArgumentParser(
-        description="Serve a non-VR keyboard page that directly drives indory_isaac_sim EE targets."
+        description="Serve a non-VR keyboard page that directly drives indory_isaac_sim EE targets.",
+        parents=[pre],
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host")
-    parser.add_argument("--port", type=int, default=8765, help="HTTP port")
-    parser.add_argument("--sim-host", default=DEFAULT_SIM_HOST)
-    parser.add_argument("--sim-pub-port", type=int, default=5555)
-    parser.add_argument("--sim-pull-port", type=int, default=5556)
-    parser.add_argument("--sim-rep-port", type=int, default=5557)
-    parser.add_argument("--robot-id", type=int, default=DEFAULT_ROBOT_ID)
-    parser.add_argument("--side", choices=ARM_SIDES, default="right")
+    parser.add_argument("--host", default=_get_nested(config, "keyboard_teleop.host", "127.0.0.1"), help="HTTP bind host")
+    parser.add_argument("--port", type=int, default=_get_nested(config, "keyboard_teleop.port", 8765), help="HTTP port")
+    parser.add_argument("--sim-host", default=_get_nested(config, "sim.host", DEFAULT_SIM_HOST))
+    parser.add_argument("--sim-pub-port", type=int, default=_get_nested(config, "sim.pub_port", 5555))
+    parser.add_argument("--sim-pull-port", type=int, default=_get_nested(config, "sim.pull_port", 5556))
+    parser.add_argument("--sim-rep-port", type=int, default=_get_nested(config, "sim.rep_port", 5557))
+    parser.add_argument("--robot-id", type=int, default=_get_nested(config, "sim.robot_id", DEFAULT_ROBOT_ID))
+    parser.add_argument("--side", choices=ARM_SIDES, default=_get_nested(config, "keyboard_teleop.side", "right"))
     parser.add_argument("--anchor-timeout", type=float, default=3.0)
     parser.add_argument(
         "--max-offset",
         type=float,
-        default=DEFAULT_MAX_OFFSET_M,
+        default=_get_nested(config, "keyboard_teleop.max_offset", DEFAULT_MAX_OFFSET_M),
         help="Clamp accumulated EE target offset to +/- this many meters per axis.",
     )
     parser.add_argument(
         "--prime-frames",
         type=int,
-        default=120,
+        default=_get_nested(config, "keyboard_teleop.prime_frames", 120),
         help="Initial current-pose command frames to seed the sim IK slots.",
     )
     parser.add_argument(
         "--prime-interval",
         type=float,
-        default=0.002,
+        default=_get_nested(config, "keyboard_teleop.prime_interval", 0.002),
         help="Seconds between initial IK prime frames.",
     )
     parser.add_argument(
         "--command-rate-hz",
         type=float,
-        default=90.0,
+        default=_get_nested(config, "keyboard_teleop.command_rate_hz", 90.0),
         help="Maximum background zero-hold heartbeat rate after a nudge.",
     )
     parser.add_argument(
         "--maintain-s",
         type=float,
-        default=5.0,
+        default=_get_nested(config, "keyboard_teleop.maintain_s", 5.0),
         help="Seconds to emit source-free zero-hold heartbeats after each input.",
     )
     parser.add_argument(
         "--feedback-rate-hz",
         type=float,
-        default=90.0,
+        default=_get_nested(config, "keyboard_teleop.feedback_rate_hz", 90.0),
         help="Set sim tf.links/proprio feedback stream rate at startup; <=0 disables.",
     )
     parser.add_argument(
         "--source-id",
-        default=None,
+        default=_get_nested(config, "keyboard_teleop.source_id", None),
         help="Command source id used by sim-side lease arbitration.",
     )
     parser.add_argument(
         "--source-role",
         choices=("teleop", "policy", "safety", "script"),
-        default="teleop",
+        default=_get_nested(config, "keyboard_teleop.source_role", "teleop"),
         help="Command source role used by sim-side lease arbitration.",
     )
     parser.add_argument(
         "--priority",
         type=int,
-        default=10,
+        default=_get_nested(config, "keyboard_teleop.priority", 10),
         help="Command source priority; higher priority can take over an active lease.",
     )
     parser.add_argument(
         "--lease-ms",
         type=int,
-        default=1000,
+        default=_get_nested(config, "keyboard_teleop.lease_ms", 1000),
         help="Command source lease duration refreshed by active commands.",
     )
     parser.add_argument("--log-level", default="INFO")

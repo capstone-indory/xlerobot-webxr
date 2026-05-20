@@ -36,12 +36,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import pathlib
 import signal
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 ROOT = pathlib.Path(__file__).resolve().parent
 PROXY = ROOT / "mac_proxy.py"
@@ -50,8 +51,30 @@ FAKE = ROOT / "fake_producer.py"
 KEYBOARD = ROOT / "keyboard_teleop.py"
 VR_DIRECT = ROOT / "vr_direct_teleop.py"
 DEMO_MP4 = ROOT / "webxr" / "assets" / "demo.mp4"
+DEFAULT_CONFIG = ROOT / "config.json"
 
 log = logging.getLogger("run")
+
+
+def _load_config(path: pathlib.Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"failed to read config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"config must be a JSON object: {path}")
+    return data
+
+
+def _get_nested(config: dict[str, Any], path: str, default: Any) -> Any:
+    cur: Any = config
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
 
 
 # ===========================================================================
@@ -205,7 +228,10 @@ def _keyboard_teleop_spec(args: argparse.Namespace) -> ChildSpec:
         "--robot-id", str(args.sim_robot_id),
         "--side", args.keyboard_side,
         "--max-offset", str(args.keyboard_max_offset),
+        "--prime-frames", str(getattr(args, "keyboard_prime_frames", 120)),
+        "--prime-interval", str(getattr(args, "keyboard_prime_interval", 0.002)),
         "--command-rate-hz", str(args.keyboard_command_rate_hz),
+        "--maintain-s", str(getattr(args, "keyboard_maintain_s", 5.0)),
         "--feedback-rate-hz", str(args.keyboard_feedback_rate_hz),
         "--log-level", args.log_level,
     ]
@@ -313,9 +339,16 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=str(DEFAULT_CONFIG))
+    pre_args, _ = pre.parse_known_args()
+    config_path = pathlib.Path(pre_args.config).expanduser()
+    config = _load_config(config_path)
+
     p = argparse.ArgumentParser(
         description="XLerobot WebXR 전체 스택 또는 non-VR keyboard teleop launcher",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        parents=[pre],
     )
     p.add_argument(
         "--keyboard-teleop",
@@ -338,39 +371,42 @@ def main() -> int:
     )
     # ── mac_proxy 인자 (그대로 통과) ─────────────────────────────────────
     g_proxy = p.add_argument_group("mac_proxy (passed-through)")
-    g_proxy.add_argument("--host", default="0.0.0.0")
-    g_proxy.add_argument("--port", type=int, default=8443)
-    g_proxy.add_argument("--signal-port", type=int, default=8444)
-    g_proxy.add_argument("--zmq-addr", default="tcp://0.0.0.0:7001")
+    g_proxy.add_argument("--host", default=_get_nested(config, "mac_proxy.host", "0.0.0.0"))
+    g_proxy.add_argument("--port", type=int, default=_get_nested(config, "mac_proxy.port", 8443))
+    g_proxy.add_argument("--signal-port", type=int, default=_get_nested(config, "mac_proxy.signal_port", 8444))
+    g_proxy.add_argument("--zmq-addr", default=_get_nested(config, "mac_proxy.zmq_addr", "tcp://0.0.0.0:7001"))
     g_proxy.add_argument("--stun", action="append", default=[],
                          help="추가 STUN URL. LAN 내에서는 보통 불필요.")
     # ── sim_video_bridge 인자 (video-source=sim 일 때만 의미) ────────────
     g_sim = p.add_argument_group("sim_video_bridge (video-source=sim)")
-    g_sim.add_argument("--sim-host", default="100.80.87.68")
-    g_sim.add_argument("--sim-port", type=int, default=5555)
-    g_sim.add_argument("--sim-pull-port", type=int, default=5556)
-    g_sim.add_argument("--sim-rep-port", type=int, default=5557)
-    g_sim.add_argument("--sim-robot-id", type=int, default=0)
-    g_sim.add_argument("--sim-topic", default="rgb.front",
+    g_sim.add_argument("--sim-host", default=_get_nested(config, "sim.host", "100.80.87.68"))
+    g_sim.add_argument("--sim-port", type=int, default=_get_nested(config, "sim.pub_port", 5555))
+    g_sim.add_argument("--sim-pull-port", type=int, default=_get_nested(config, "sim.pull_port", 5556))
+    g_sim.add_argument("--sim-rep-port", type=int, default=_get_nested(config, "sim.rep_port", 5557))
+    g_sim.add_argument("--sim-robot-id", type=int, default=_get_nested(config, "sim.robot_id", 0))
+    g_sim.add_argument("--sim-topic", default=_get_nested(config, "sim.topic", "rgb.front"),
                        help="rgb.front | rgb.wrist")
-    g_sim.add_argument("--video-fps", type=int, default=30)
+    g_sim.add_argument("--video-fps", type=int, default=_get_nested(config, "video.fps", 30))
     # ── non-VR keyboard teleop 인자 ─────────────────────────────────────
     g_keyboard = p.add_argument_group("keyboard_teleop (--keyboard-teleop)")
-    g_keyboard.add_argument("--keyboard-host", default="127.0.0.1")
-    g_keyboard.add_argument("--keyboard-port", type=int, default=8765)
-    g_keyboard.add_argument("--keyboard-side", choices=["right", "left"], default="right")
-    g_keyboard.add_argument("--keyboard-max-offset", type=float, default=0.80)
-    g_keyboard.add_argument("--keyboard-command-rate-hz", type=float, default=90.0)
-    g_keyboard.add_argument("--keyboard-feedback-rate-hz", type=float, default=90.0)
+    g_keyboard.add_argument("--keyboard-host", default=_get_nested(config, "keyboard_teleop.host", "127.0.0.1"))
+    g_keyboard.add_argument("--keyboard-port", type=int, default=_get_nested(config, "keyboard_teleop.port", 8765))
+    g_keyboard.add_argument("--keyboard-side", choices=["right", "left"], default=_get_nested(config, "keyboard_teleop.side", "right"))
+    g_keyboard.add_argument("--keyboard-max-offset", type=float, default=_get_nested(config, "keyboard_teleop.max_offset", 0.80))
+    g_keyboard.add_argument("--keyboard-prime-frames", type=int, default=_get_nested(config, "keyboard_teleop.prime_frames", 120))
+    g_keyboard.add_argument("--keyboard-prime-interval", type=float, default=_get_nested(config, "keyboard_teleop.prime_interval", 0.002))
+    g_keyboard.add_argument("--keyboard-command-rate-hz", type=float, default=_get_nested(config, "keyboard_teleop.command_rate_hz", 90.0))
+    g_keyboard.add_argument("--keyboard-maintain-s", type=float, default=_get_nested(config, "keyboard_teleop.maintain_s", 5.0))
+    g_keyboard.add_argument("--keyboard-feedback-rate-hz", type=float, default=_get_nested(config, "keyboard_teleop.feedback_rate_hz", 90.0))
     # ── direct VR arm bridge 인자 ────────────────────────────────────────
     g_vr = p.add_argument_group("vr_direct_teleop (--vr-direct-teleop)")
-    g_vr.add_argument("--pose-host", default="127.0.0.1")
-    g_vr.add_argument("--pose-port", type=int, default=7001)
-    g_vr.add_argument("--vr-side", choices=["right", "left", "both"], default="right")
-    g_vr.add_argument("--vr-rate-hz", type=float, default=90.0)
-    g_vr.add_argument("--vr-feedback-rate-hz", type=float, default=90.0)
-    g_vr.add_argument("--vr-position-scale", type=float, default=1.0)
-    g_vr.add_argument("--vr-grip-threshold", type=float, default=0.5)
+    g_vr.add_argument("--pose-host", default=_get_nested(config, "vr_direct_teleop.pose_host", "127.0.0.1"))
+    g_vr.add_argument("--pose-port", type=int, default=_get_nested(config, "vr_direct_teleop.pose_port", 7001))
+    g_vr.add_argument("--vr-side", choices=["right", "left", "both"], default=_get_nested(config, "vr_direct_teleop.side", "right"))
+    g_vr.add_argument("--vr-rate-hz", type=float, default=_get_nested(config, "vr_direct_teleop.rate_hz", 90.0))
+    g_vr.add_argument("--vr-feedback-rate-hz", type=float, default=_get_nested(config, "vr_direct_teleop.feedback_rate_hz", 90.0))
+    g_vr.add_argument("--vr-position-scale", type=float, default=_get_nested(config, "vr_direct_teleop.position_scale", 1.0))
+    g_vr.add_argument("--vr-grip-threshold", type=float, default=_get_nested(config, "vr_direct_teleop.grip_threshold", 0.5))
     # ── 공통 ───────────────────────────────────────────────────────────
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args()

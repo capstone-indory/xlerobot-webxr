@@ -89,6 +89,7 @@
 
 <script type="module">
 import * as THREE from "three";
+import { STLLoader } from "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/loaders/STLLoader.js";
 
 const QUERY = new URLSearchParams(location.search);
 const XR_SESSION_MODE = "immersive-ar";
@@ -325,6 +326,388 @@ const controllerPointers = {
   right: makeControllerPointer(0x06b6d4),
   left: makeControllerPointer(0xa78bfa),
 };
+
+// ───────────────────────────────────────────────────────────────────────────
+// IK model preview
+//   Loads the xlerobot URDF/STL model and runs a lightweight position-only CCD
+//   IK preview locally. This is still only a command-intent preview; sim-side IK
+//   and physics remain authoritative.
+// ───────────────────────────────────────────────────────────────────────────
+const PREVIEW_GRIP_THRESHOLD = 0.5;
+const PREVIEW_POSITION_SCALE = (() => {
+  const v = Number.parseFloat(QUERY.get("preview_scale") || "1.0");
+  return Number.isFinite(v) && v > 0 ? v : 1.0;
+})();
+const previewAnchor = {
+  right: null,
+  left: null,
+};
+
+const previewRoot = new THREE.Group();
+previewRoot.name = "xlerobot-ik-preview";
+previewRoot.position.set(1.03, -0.05, 0.03);
+previewRoot.scale.setScalar(1.0);
+panelRoot.add(previewRoot);
+
+const previewCard = new THREE.Mesh(
+  new THREE.PlaneGeometry(0.66, 0.72),
+  new THREE.MeshBasicMaterial({
+    color: 0x020617,
+    transparent: true,
+    opacity: 0.58,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  })
+);
+previewCard.position.set(0, 0, -0.02);
+previewRoot.add(previewCard);
+previewCard.add(makePanelFrame(0.66, 0.72, 0x34d399));
+
+function makePreviewLabel(text, color = "#cbd5e1") {
+  const c = document.createElement("canvas");
+  c.width = 512; c.height = 128;
+  const ctx = c.getContext("2d");
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.fillStyle = color;
+  ctx.font = "bold 44px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, c.width / 2, c.height / 2);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.52, 0.13),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false })
+  );
+  mesh.userData.texture = tex;
+  return mesh;
+}
+
+const previewTitle = makePreviewLabel("xlerobot IK preview", "#67e8f9");
+previewTitle.position.set(0, 0.3, 0.01);
+previewRoot.add(previewTitle);
+
+const previewHint = makePreviewLabel("hold grip to preview", "#94a3b8");
+previewHint.position.set(0, -0.3, 0.01);
+previewRoot.add(previewHint);
+
+const robotPreview = new THREE.Group();
+robotPreview.name = "xlerobot-urdf-model";
+robotPreview.position.set(0, -0.36, 0.07);
+robotPreview.rotation.set(-0.42, 0, -0.22);
+robotPreview.scale.setScalar(0.55);
+previewRoot.add(robotPreview);
+
+const previewTargetMeshes = {
+  right: makeTargetMarker(0x06b6d4),
+  left: makeTargetMarker(0xa78bfa),
+};
+for (const marker of Object.values(previewTargetMeshes)) {
+  marker.visible = false;
+  robotPreview.add(marker);
+}
+
+function makeTargetMarker(color) {
+  const root = new THREE.Group();
+  const sphere = new THREE.Mesh(
+    new THREE.SphereGeometry(0.025, 18, 12),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.8 })
+  );
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.04, 0.055, 32),
+    new THREE.MeshBasicMaterial({
+      color,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.75,
+    })
+  );
+  root.add(sphere, ring);
+  return root;
+}
+
+const stlLoader = new STLLoader();
+const robotMaterials = {
+  white: new THREE.MeshStandardMaterial({ color: 0xcbd5e1, roughness: 0.68, metalness: 0.03 }),
+  grey: new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.72, metalness: 0.05 }),
+  blue: new THREE.MeshStandardMaterial({ color: 0x2563eb, roughness: 0.7, metalness: 0.04 }),
+  green: new THREE.MeshStandardMaterial({ color: 0x84cc16, roughness: 0.72, metalness: 0.02 }),
+  motor: new THREE.MeshStandardMaterial({ color: 0x111827, roughness: 0.6, metalness: 0.12 }),
+  fallback: new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.72, metalness: 0.04 }),
+};
+
+const ikPreview = {
+  loaded: false,
+  loadError: null,
+  links: new Map(),
+  joints: new Map(),
+  jointOrder: [],
+  arms: {
+    right: {
+      joints: ["Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll"],
+      tip: "Fixed_Jaw_tip",
+      q: {
+        Rotation: 0.0,
+        Pitch: 0.553637,
+        Elbow: 1.172974,
+        Wrist_Pitch: -1.064954,
+        Wrist_Roll: 0.0,
+      },
+      homeTarget: null,
+      solvedTarget: null,
+      errorM: 0,
+    },
+    left: {
+      joints: ["Rotation_2", "Pitch_2", "Elbow_2", "Wrist_Pitch_2", "Wrist_Roll_2"],
+      tip: "Fixed_Jaw_tip_2",
+      q: {
+        Rotation_2: 0.0,
+        Pitch_2: 0.553637,
+        Elbow_2: 1.172974,
+        Wrist_Pitch_2: -1.064954,
+        Wrist_Roll_2: 0.0,
+      },
+      homeTarget: null,
+      solvedTarget: null,
+      errorM: 0,
+    },
+  },
+};
+
+function parseVec3(value, fallback = [0, 0, 0]) {
+  if (!value) return new THREE.Vector3(...fallback);
+  const parts = value.trim().split(/\s+/).map(Number);
+  return new THREE.Vector3(parts[0] || 0, parts[1] || 0, parts[2] || 0);
+}
+
+function parseOrigin(node) {
+  const origin = node?.querySelector(":scope > origin");
+  const xyz = parseVec3(origin?.getAttribute("xyz"));
+  const rpy = parseVec3(origin?.getAttribute("rpy"));
+  const quat = new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(rpy.x, rpy.y, rpy.z, "XYZ")
+  );
+  return { xyz, quat };
+}
+
+function clampValue(value, lower, upper) {
+  return Math.min(upper, Math.max(lower, value));
+}
+
+function visualMaterial(root, visual) {
+  const ref = visual.querySelector(":scope > material")?.getAttribute("name");
+  if (ref && robotMaterials[ref]) return robotMaterials[ref];
+  return robotMaterials.fallback;
+}
+
+async function loadXlerobotPreview() {
+  const baseUrl = "./assets/robots/xlerobot/";
+  try {
+    const text = await fetch(`${baseUrl}xlerobot.urdf`).then((res) => {
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.text();
+    });
+    const doc = new DOMParser().parseFromString(text, "application/xml");
+    const linkDefs = [...doc.querySelectorAll("link")];
+    const jointDefs = [...doc.querySelectorAll("joint")];
+
+    for (const link of linkDefs) {
+      const name = link.getAttribute("name");
+      const group = new THREE.Group();
+      group.name = `link:${name}`;
+      ikPreview.links.set(name, group);
+      for (const visual of [...link.querySelectorAll(":scope > visual")]) {
+        const meshNode = visual.querySelector("mesh");
+        const filename = meshNode?.getAttribute("filename") || "";
+        if (!filename.toLowerCase().endsWith(".stl")) continue;
+        const origin = parseOrigin(visual);
+        const scale = parseVec3(meshNode.getAttribute("scale"), [1, 1, 1]);
+        stlLoader.load(
+          `${baseUrl}${filename}`,
+          (geometry) => {
+            geometry.computeVertexNormals();
+            const mesh = new THREE.Mesh(geometry, visualMaterial(doc, visual));
+            mesh.position.copy(origin.xyz);
+            mesh.quaternion.copy(origin.quat);
+            mesh.scale.copy(scale);
+            mesh.castShadow = false;
+            mesh.receiveShadow = false;
+            group.add(mesh);
+          },
+          undefined,
+          (err) => logLine(`preview mesh load failed: ${filename} (${err?.message || "?"})`, "err")
+        );
+      }
+    }
+
+    for (const joint of jointDefs) {
+      const name = joint.getAttribute("name");
+      const type = joint.getAttribute("type") || "fixed";
+      const parent = joint.querySelector(":scope > parent")?.getAttribute("link");
+      const child = joint.querySelector(":scope > child")?.getAttribute("link");
+      const origin = parseOrigin(joint);
+      const axis = parseVec3(joint.querySelector(":scope > axis")?.getAttribute("xyz"), [0, 0, 1]).normalize();
+      const limit = joint.querySelector(":scope > limit");
+      const lower = Number.parseFloat(limit?.getAttribute("lower") ?? "-3.14159");
+      const upper = Number.parseFloat(limit?.getAttribute("upper") ?? "3.14159");
+      const frame = new THREE.Group();
+      frame.name = `joint:${name}`;
+      const item = {
+        name, type, parent, child, frame,
+        originPos: origin.xyz,
+        originQuat: origin.quat,
+        axis,
+        q: 0,
+        lower: Number.isFinite(lower) ? lower : -Math.PI,
+        upper: Number.isFinite(upper) ? upper : Math.PI,
+      };
+      ikPreview.joints.set(name, item);
+      ikPreview.jointOrder.push(item);
+    }
+
+    const childLinks = new Set();
+    for (const joint of ikPreview.jointOrder) {
+      const parentLink = ikPreview.links.get(joint.parent);
+      const childLink = ikPreview.links.get(joint.child);
+      if (!parentLink || !childLink) continue;
+      parentLink.add(joint.frame);
+      joint.frame.add(childLink);
+      childLinks.add(joint.child);
+    }
+    const rootLinkName = [...ikPreview.links.keys()].find((name) => !childLinks.has(name)) || "root";
+    robotPreview.add(ikPreview.links.get(rootLinkName));
+
+    for (const side of ["right", "left"]) {
+      Object.assign(ikPreview.arms[side].q, ikPreview.arms[side].q);
+    }
+    applyIkPose();
+    robotPreview.updateMatrixWorld(true);
+    for (const side of ["right", "left"]) {
+      const tip = ikPreview.links.get(ikPreview.arms[side].tip);
+      const p = new THREE.Vector3();
+      tip?.getWorldPosition(p);
+      ikPreview.arms[side].homeTarget = robotPreview.worldToLocal(p.clone());
+      ikPreview.arms[side].solvedTarget = ikPreview.arms[side].homeTarget.clone();
+    }
+    ikPreview.loaded = true;
+    logLine("xlerobot URDF IK preview loaded", "ok");
+  } catch (e) {
+    ikPreview.loadError = e;
+    logLine(`xlerobot preview load failed: ${e.message}`, "err");
+  }
+}
+
+function applyIkPose() {
+  for (const side of ["right", "left"]) {
+    const arm = ikPreview.arms[side];
+    for (const name of arm.joints) {
+      const joint = ikPreview.joints.get(name);
+      if (!joint) continue;
+      joint.q = clampValue(arm.q[name] ?? 0, joint.lower, joint.upper);
+    }
+  }
+  for (const joint of ikPreview.jointOrder) {
+    joint.frame.position.copy(joint.originPos);
+    joint.frame.quaternion.copy(joint.originQuat);
+    if (joint.type === "revolute" || joint.type === "continuous") {
+      const rot = new THREE.Quaternion().setFromAxisAngle(joint.axis, joint.q);
+      joint.frame.quaternion.multiply(rot);
+    } else if (joint.type === "prismatic") {
+      joint.frame.position.add(joint.axis.clone().multiplyScalar(joint.q));
+    }
+  }
+}
+
+const _ikEnd = new THREE.Vector3();
+const _ikJointPos = new THREE.Vector3();
+const _ikToEnd = new THREE.Vector3();
+const _ikToTarget = new THREE.Vector3();
+const _ikAxis = new THREE.Vector3();
+const _ikQuat = new THREE.Quaternion();
+
+function solveIk(side, targetLocal) {
+  const arm = ikPreview.arms[side];
+  const tip = ikPreview.links.get(arm.tip);
+  if (!tip || !targetLocal) return;
+  const targetWorld = robotPreview.localToWorld(targetLocal.clone());
+  for (let iter = 0; iter < 10; iter++) {
+    for (let i = arm.joints.length - 1; i >= 0; i--) {
+      const joint = ikPreview.joints.get(arm.joints[i]);
+      if (!joint || joint.type !== "revolute") continue;
+      robotPreview.updateMatrixWorld(true);
+      tip.getWorldPosition(_ikEnd);
+      joint.frame.getWorldPosition(_ikJointPos);
+      _ikToEnd.copy(_ikEnd).sub(_ikJointPos);
+      _ikToTarget.copy(targetWorld).sub(_ikJointPos);
+      if (_ikToEnd.lengthSq() < 1e-8 || _ikToTarget.lengthSq() < 1e-8) continue;
+      _ikToEnd.normalize();
+      _ikToTarget.normalize();
+      joint.frame.getWorldQuaternion(_ikQuat);
+      _ikAxis.copy(joint.axis).applyQuaternion(_ikQuat).normalize();
+      const cross = new THREE.Vector3().crossVectors(_ikToEnd, _ikToTarget);
+      const signed = Math.atan2(cross.dot(_ikAxis), clampValue(_ikToEnd.dot(_ikToTarget), -1, 1));
+      const step = clampValue(signed, -0.18, 0.18);
+      arm.q[joint.name] = clampValue((arm.q[joint.name] ?? 0) + step, joint.lower, joint.upper);
+      applyIkPose();
+    }
+    robotPreview.updateMatrixWorld(true);
+    tip.getWorldPosition(_ikEnd);
+    if (_ikEnd.distanceTo(targetWorld) < 0.006) break;
+  }
+  robotPreview.updateMatrixWorld(true);
+  tip.getWorldPosition(_ikEnd);
+  arm.errorM = _ikEnd.distanceTo(targetWorld);
+}
+
+function xrDeltaToRobot(delta, scale = PREVIEW_POSITION_SCALE) {
+  // WebXR: +X right, +Y up, -Z forward. Robot base: +X forward, +Y left, +Z up.
+  return [-delta[2] * scale, -delta[0] * scale, delta[1] * scale];
+}
+
+function robotDeltaToModel(deltaRobot) {
+  return new THREE.Vector3(deltaRobot[0], deltaRobot[1], deltaRobot[2]);
+}
+
+function updateExpectedMotionPreview(nowMs) {
+  if (!ikPreview.loaded) return;
+  let anyHeld = false;
+  for (const side of ["left", "right"]) {
+    const hand = state[side];
+    const arm = ikPreview.arms[side];
+    const marker = previewTargetMeshes[side];
+    const pose = hand.pose;
+    const held = !!pose && hand.grip >= PREVIEW_GRIP_THRESHOLD && !state.estop;
+    const anchorKey = side === "right" ? "a" : "x";
+    const anchorPulseFresh = nowMs - state.anchorResetPulse[side] < 120;
+
+    if (!held) {
+      previewAnchor[side] = null;
+      marker.visible = false;
+      continue;
+    }
+
+    anyHeld = true;
+    if (!previewAnchor[side] || hand.buttons[anchorKey] || anchorPulseFresh) {
+      previewAnchor[side] = pose.slice(0, 3);
+    }
+
+    const deltaXr = [
+      pose[0] - previewAnchor[side][0],
+      pose[1] - previewAnchor[side][1],
+      pose[2] - previewAnchor[side][2],
+    ];
+    const deltaRobot = xrDeltaToRobot(deltaXr);
+    const target = arm.homeTarget.clone().add(robotDeltaToModel(deltaRobot));
+    arm.solvedTarget = target;
+    marker.position.copy(target);
+    marker.visible = true;
+    solveIk(side, target);
+  }
+  previewHint.visible = !anyHeld;
+  previewCard.material.opacity = anyHeld ? 0.72 : 0.58;
+}
+
+loadXlerobotPreview();
 
 // ───────────────────────────────────────────────────────────────────────────
 // State (mirrors §4.1 WebSocket payload schema)
@@ -883,6 +1266,7 @@ renderer.setAnimationLoop((time, frame) => {
       if (!seenHands[hand]) hideControllerPointer(hand);
     }
     applyNoControllerDevFallback(seenHands);
+    updateExpectedMotionPreview(now);
     // throttled WS send
     if (ws && ws.readyState === WebSocket.OPEN && now - lastSendT >= 1000 / POSE_SEND_HZ) {
       lastSendT = now;
@@ -959,9 +1343,10 @@ function drawHUD() {
   );
   c.fillStyle = "#94a3b8";
   c.fillText("ready/e-stop=right B toggle", 700, 160);
+  c.fillText("preview: grip shows expected EE target", 700, 182);
   if (DEV_NO_CONTROLLER) {
     c.fillStyle = "#fbbf24";
-    c.fillText("DEV no-controller", 700, 182);
+    c.fillText("DEV no-controller", 700, 204);
   }
 
   // anchor reset flashes

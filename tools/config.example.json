@@ -1,0 +1,43 @@
+{
+  "keyboard_teleop": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "side": "right",
+    "max_offset": 0.8,
+    "prime_frames": 120,
+    "prime_interval": 0.002,
+    "command_rate_hz": 90.0,
+    "maintain_s": 5.0,
+    "feedback_rate_hz": 90.0,
+    "source_id": null,
+    "source_role": "teleop",
+    "priority": 10,
+    "lease_ms": 1000
+  },
+  "sim": {
+    "host": "100.80.87.68",
+    "pub_port": 5555,
+    "pull_port": 5556,
+    "rep_port": 5557,
+    "robot_id": 0,
+    "topic": "rgb.front"
+  },
+  "mac_proxy": {
+    "host": "0.0.0.0",
+    "port": 8443,
+    "signal_port": 8444,
+    "zmq_addr": "tcp://0.0.0.0:7001"
+  },
+  "video": {
+    "fps": 30
+  },
+  "vr_direct_teleop": {
+    "pose_host": "127.0.0.1",
+    "pose_port": 7001,
+    "side": "right",
+    "rate_hz": 90.0,
+    "feedback_rate_hz": 90.0,
+    "position_scale": 1.0,
+    "grip_threshold": 0.5
+  }
+}

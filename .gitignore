@@ -12,6 +12,9 @@ venv/
 tools/reports/*.csv
 tools/reports/*.jsonl
 
+# local runtime config
+tools/config.json
+
 # editor
 .vscode/
 .idea/

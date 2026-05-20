@@ -331,6 +331,9 @@ arm fold가 USD/PhysX collision에 막히지 않게 한다.
 `tools/run.py --keyboard-teleop`는 `--sim-rep-port`도 전달하므로 custom sim port
 세트에서도 `tf.links`/`proprio` feedback stream을 90Hz로 올리는 RPC가 올바른 서버에
 도달한다. 필요하면 `--keyboard-feedback-rate-hz 0`으로 이 자동 설정을 끌 수 있다.
+로컬 기본값은 `tools/config.json`으로 override할 수 있다. repo에는
+`tools/config.example.json`만 커밋하고, 실제 `tools/config.json`은 `.gitignore`에 둔다.
+CLI 인자는 config 값보다 우선한다.
 브라우저 전송 loop는 `requestAnimationFrame`으로 계속 돌며 `hz` query 값으로만
 throttle한다. 기본 `hz=90`이라 Quest/WebXR 90Hz cadence와 맞고, 60Hz 화면에서는
 display frame rate까지 자연스럽게 내려간다. 물리 키보드의 첫 `keydown`과 `keyup`은
