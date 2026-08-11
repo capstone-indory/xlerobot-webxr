@@ -193,6 +193,11 @@ def _pose_stream_metrics(
     }
 
 
+def _monotonic_age_supported(mac_host: str) -> bool:
+    """Only compare monotonic_ns stamps when publisher and probe share a host."""
+    return mac_host in {"127.0.0.1", "localhost", "::1"}
+
+
 async def _open_ws(cfg: ProbeConfig):
     url = f"wss://{cfg.mac_host}:{cfg.page_port}/ws?robot={cfg.robot_id}"
     ssl_ctx = _ssl_unverified()
@@ -239,6 +244,7 @@ async def probe_mac_pose(cfg: ProbeConfig) -> dict[str, Any]:
         recv_times_ns: list[int] = []
         mac_to_sub_age_ms: list[float] = []
         first: dict[str, Any] | None = None
+        compare_monotonic_age = _monotonic_age_supported(cfg.mac_host)
         deadline = time.monotonic() + max(float(cfg.listen_s), cfg.frames / 60.0)
         min_synthetic_count = max(10, int(cfg.frames * cfg.pose_min_count_ratio))
         while time.monotonic() < deadline:
@@ -248,7 +254,7 @@ async def probe_mac_pose(cfg: ProbeConfig) -> dict[str, Any]:
                 recv_ns = time.monotonic_ns()
                 recv_times_ns.append(recv_ns)
                 stamp_ns = msg.get("stamp_ns")
-                if isinstance(stamp_ns, int):
+                if compare_monotonic_age and isinstance(stamp_ns, int):
                     age_ms = (recv_ns - stamp_ns) / 1e6
                     if math.isfinite(age_ms) and age_ms >= 0.0:
                         mac_to_sub_age_ms.append(age_ms)
@@ -264,7 +270,11 @@ async def probe_mac_pose(cfg: ProbeConfig) -> dict[str, Any]:
         if task is not None:
             await task
         metrics = _pose_stream_metrics(recv_times_ns, mac_to_sub_age_ms)
-        return {"first": first, **metrics}
+        return {
+            "first": first,
+            "monotonic_age_supported": compare_monotonic_age,
+            **metrics,
+        }
     finally:
         sub.close(linger=0)
 
@@ -676,6 +686,11 @@ async def main_async(args: argparse.Namespace) -> int:
         f"p95={_fmt(mac['mac_to_sub_age_ms_p95'])} "
         f"max={_fmt(mac['mac_to_sub_age_ms_max'])}"
     )
+    if not mac.get("monotonic_age_supported", True):
+        print(
+            "    mac_to_sub_age_ms skipped: Mac and probe monotonic clocks "
+            "are on different hosts"
+        )
     print(
         "    first="
         f"schema={first.get('schema')!r} robot_id={first.get('robot_id')} "

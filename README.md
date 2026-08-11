@@ -56,6 +56,7 @@ python3 tools/run.py --sim-robot-id 1                   # 다른 로봇
 python3 tools/run.py --sim-topic rgb.wrist              # wrist 카메라
 python3 tools/run.py --video-source fake                # sim 안 켰을 때 demo.mp4 loop
 python3 tools/run.py --video-source none                # 영상 없이 텔레옵 wire 만
+python3 tools/run.py --pose-only                        # aiortc/PyAV 없이 page+/ws+ZMQ pose 만
 
 # 도움말
 python3 tools/run.py --help
@@ -84,6 +85,10 @@ cd Indory/xlerobot-webxr
 # 케이스에서 msgpack 같은 패키지를 다른 site-packages 에 깔게 됨.
 python3 -m pip install -r tools/requirements.txt        # 처음 한 번만
 python3 tools/mac_proxy.py
+
+# 비디오 없이 VR controller teleop만 검증할 때:
+python3 -m pip install aiohttp pyzmq msgpack psutil
+python3 tools/mac_proxy.py --pose-only
 ```
 
 기동 로그에 인터페이스 점검이 같이 찍힌다:
@@ -494,6 +499,8 @@ bridge는 이 false 복귀를 release로 해석해야 한다.
 
 - `serve.py` — M0b 검증 전용. WebRTC / ZMQ 없이 페이지 + /ws echo 만. 의존성 `aiohttp` 1개.
 - `mac_proxy.py` — M3 이후 본 운영. 페이지 + /ws→ZMQ + WebRTC SFU + ICE relay 통째. 의존성은 `requirements.txt`.
+- `mac_proxy.py --pose-only` — Quest pose/trigger/grip teleop만 필요할 때. WebRTC
+  signaling/video를 끄므로 `aiohttp`, `pyzmq`, `msgpack`, `psutil`만 있으면 된다.
 
 두 스크립트는 같은 `tools/webxr/dev-cert.pem` 자기서명 인증서를 공유. mac_proxy
 가 켜져 있으면 serve.py 는 띄울 필요 없음.

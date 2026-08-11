@@ -54,6 +54,12 @@ def test_pose_stream_metrics_handles_missing_samples():
     }
 
 
+def test_monotonic_age_only_supported_for_local_mac_host():
+    assert teleop_probe._monotonic_age_supported("127.0.0.1")
+    assert teleop_probe._monotonic_age_supported("localhost")
+    assert not teleop_probe._monotonic_age_supported("100.81.219.12")
+
+
 def test_teleop_probe_exposes_live_quest_acceptance_flags():
     source = (TOOLS / "teleop_probe.py").read_text()
 

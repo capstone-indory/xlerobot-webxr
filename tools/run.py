@@ -156,6 +156,8 @@ def _proxy_spec(args: argparse.Namespace) -> ChildSpec:
     ]
     for s in args.stun:
         argv += ["--stun", s]
+    if args.pose_only:
+        argv.append("--pose-only")
     return ChildSpec(label="proxy ", argv=argv)
 
 
@@ -246,7 +248,9 @@ async def run(args: argparse.Namespace) -> int:
         specs: List[ChildSpec] = [_keyboard_teleop_spec(args)]
     else:
         specs = [_proxy_spec(args)]
-        if args.video_source == "sim":
+        if args.pose_only:
+            pass
+        elif args.video_source == "sim":
             specs.append(_sim_bridge_spec(args))
         elif args.video_source == "fake":
             specs.append(_fake_producer_spec(args))
@@ -344,6 +348,11 @@ def main() -> int:
     g_proxy.add_argument("--zmq-addr", default="tcp://0.0.0.0:7001")
     g_proxy.add_argument("--stun", action="append", default=[],
                          help="추가 STUN URL. LAN 내에서는 보통 불필요.")
+    g_proxy.add_argument(
+        "--pose-only",
+        action="store_true",
+        help="mac_proxy 를 page+/ws/ZMQ pose only 로 실행하고 aiortc/WebRTC video signaling 을 끔",
+    )
     # ── sim_video_bridge 인자 (video-source=sim 일 때만 의미) ────────────
     g_sim = p.add_argument_group("sim_video_bridge (video-source=sim)")
     g_sim.add_argument("--sim-host", default="100.80.87.68")

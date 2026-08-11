@@ -65,6 +65,22 @@ def test_run_launcher_passes_vr_direct_rate():
     assert spec.argv[spec.argv.index("--sim-rep-port") + 1] == "6657"
 
 
+def test_run_launcher_passes_proxy_pose_only():
+    args = Namespace(
+        host="0.0.0.0",
+        port=8443,
+        signal_port=8444,
+        zmq_addr="tcp://0.0.0.0:7001",
+        stun=[],
+        log_level="INFO",
+        pose_only=True,
+    )
+
+    spec = run_tool._proxy_spec(args)
+
+    assert "--pose-only" in spec.argv
+
+
 def test_run_launcher_passes_keyboard_ports_and_teleop_rates():
     args = Namespace(
         keyboard_host="127.0.0.1",

@@ -579,6 +579,12 @@ def test_browser_loop_sends_only_pending_or_held_commands():
     assert "&& hasPendingCommand()" in keyboard_teleop.HTML
 
 
+def test_keyboard_gripper_defaults_use_responsive_delta():
+    assert keyboard_teleop.DEFAULT_GRIPPER_STEP == pytest.approx(0.040)
+    assert 'query.get("grip_step") || "0.040"' in keyboard_teleop.HTML
+    assert "DEFAULT_GRIPPER_STEP" in inspect.getsource(keyboard_teleop.api_nudge)
+
+
 def test_keyboard_zero_hold_heartbeat_is_throttled_and_source_free():
     source = inspect.getsource(keyboard_teleop.DirectSimTeleop.maintain_loop)
     hold_source = inspect.getsource(keyboard_teleop.DirectSimTeleop._send_hold)

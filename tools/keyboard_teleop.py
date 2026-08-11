@@ -50,6 +50,7 @@ DEFAULT_ROBOT_ID = 0
 DEFAULT_STEP_M = 0.100
 DEFAULT_SPEED_MPS = 0.800
 DEFAULT_MAX_OFFSET_M = 0.800
+DEFAULT_GRIPPER_STEP = 0.040
 ZERO_HOLD_HEARTBEAT_HZ = 5.0
 
 
@@ -166,7 +167,7 @@ const stepM = Number.parseFloat(query.get("step") || "0.100");
 const speedMps = Number.parseFloat(query.get("speed") || "0.800");
 const maxOffset = Number.parseFloat(query.get("max_offset") || "0.800");
 const panStep = Number.parseFloat(query.get("pan_step") || "0.050");
-const gripStep = Number.parseFloat(query.get("grip_step") || "0.010");
+const gripStep = Number.parseFloat(query.get("grip_step") || "0.040");
 const maxPan = Number.parseFloat(query.get("max_pan") || "0.700");
 const motionKeys = new Set(["KeyW", "KeyS", "KeyR", "KeyF"]);
 const pressed = new Set();
@@ -995,7 +996,9 @@ async def api_nudge(request: web.Request) -> web.Response:
     hz = float(data.get("hz") or request.query.get("hz") or 90.0)
     step_m = float(data.get("step") or request.query.get("step") or DEFAULT_STEP_M)
     pan_step = float(data.get("pan_step") or request.query.get("pan_step") or 0.050)
-    grip_step = float(data.get("grip_step") or request.query.get("grip_step") or 0.010)
+    grip_step = float(
+        data.get("grip_step") or request.query.get("grip_step") or DEFAULT_GRIPPER_STEP
+    )
     frames = max(1, min(frames, 30))
     hz = max(1.0, min(hz, 90.0))
 

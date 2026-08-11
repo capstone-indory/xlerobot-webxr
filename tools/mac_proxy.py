@@ -60,22 +60,67 @@ import msgpack
 import zmq
 import zmq.asyncio
 from aiohttp import WSMsgType, web
-from aiortc import (
-    RTCConfiguration,
-    RTCIceCandidate,
-    RTCIceServer,
-    RTCPeerConnection,
-    RTCSessionDescription,
-)
-from aiortc.contrib.media import MediaRelay
-
-# candidate_from_sdp 위치는 aiortc 버전에 따라 다름 — 폴백 두 군데 시도
-try:
-    from aiortc.sdp import candidate_from_sdp  # >= 1.5
-except ImportError:  # pragma: no cover
-    from aiortc.rtcicetransport import candidate_from_sdp  # type: ignore
 
 log = logging.getLogger("mac_proxy")
+
+RTCConfiguration = None
+RTCIceCandidate = None
+RTCIceServer = None
+RTCPeerConnection = None
+RTCSessionDescription = None
+MediaRelay = None
+candidate_from_sdp = None
+_WEBRTC_IMPORT_ERROR: Optional[BaseException] = None
+
+
+def _load_webrtc_deps() -> None:
+    """Import aiortc/PyAV only when WebRTC signaling is enabled.
+
+    Pose-only VR teleop only needs HTTPS `/ws` plus ZMQ pose forwarding. Keeping
+    WebRTC optional lets a Mac run controller teleop even when PyAV wheels are
+    unavailable for its Python/macOS combination.
+    """
+    global RTCConfiguration
+    global RTCIceCandidate
+    global RTCIceServer
+    global RTCPeerConnection
+    global RTCSessionDescription
+    global MediaRelay
+    global candidate_from_sdp
+    global _WEBRTC_IMPORT_ERROR
+
+    if RTCPeerConnection is not None:
+        return
+    try:
+        from aiortc import (  # type: ignore
+            RTCConfiguration as _RTCConfiguration,
+            RTCIceCandidate as _RTCIceCandidate,
+            RTCIceServer as _RTCIceServer,
+            RTCPeerConnection as _RTCPeerConnection,
+            RTCSessionDescription as _RTCSessionDescription,
+        )
+        from aiortc.contrib.media import MediaRelay as _MediaRelay  # type: ignore
+
+        try:
+            from aiortc.sdp import candidate_from_sdp as _candidate_from_sdp  # type: ignore
+        except ImportError:  # pragma: no cover
+            from aiortc.rtcicetransport import (  # type: ignore
+                candidate_from_sdp as _candidate_from_sdp,
+            )
+    except ImportError as exc:
+        _WEBRTC_IMPORT_ERROR = exc
+        raise RuntimeError(
+            "WebRTC signaling requires aiortc/PyAV. Re-run with --pose-only "
+            "for controller teleop without video, or install tools/requirements.txt."
+        ) from exc
+
+    RTCConfiguration = _RTCConfiguration
+    RTCIceCandidate = _RTCIceCandidate
+    RTCIceServer = _RTCIceServer
+    RTCPeerConnection = _RTCPeerConnection
+    RTCSessionDescription = _RTCSessionDescription
+    MediaRelay = _MediaRelay
+    candidate_from_sdp = _candidate_from_sdp
 
 
 # ===========================================================================
@@ -91,6 +136,7 @@ class Config:
     webroot: pathlib.Path = pathlib.Path(__file__).resolve().parent / "webxr"
     cert_dir: pathlib.Path = pathlib.Path(__file__).resolve().parent / "webxr"
     stun_urls: list = field(default_factory=list)
+    pose_only: bool = False
     # 기동 시 categorize_interfaces() 결과를 담아두는 자리.
     # _run() 의 접속 URL 배너에서 사용.
     detected_ifaces: Dict[str, list] = field(default_factory=dict)
@@ -387,6 +433,7 @@ class MediaHub:
     """
 
     def __init__(self):
+        _load_webrtc_deps()
         self._relay = MediaRelay()
         self._server_track = None  # 가장 최근 들어온 raw track (relay 의 source)
         self._quest_senders: Dict[str, "object"] = {}  # session_id -> RTCRtpSender
@@ -675,6 +722,7 @@ async def _signaling_index(request: web.Request) -> web.Response:
 
 
 def make_signaling_app(hub: MediaHub, stun_urls: list) -> web.Application:
+    _load_webrtc_deps()
     app = web.Application()
     q = QuestSignalingHandler(hub, stun_urls)
     s = ServerSignalingHandler(hub, stun_urls)
@@ -696,16 +744,19 @@ async def _run(cfg: Config) -> None:
     await publisher.start()
 
     pose_handler = PoseWSHandler(publisher)
-    hub = MediaHub()
 
     page_app = make_page_app(cfg.webroot, pose_handler)
-    sig_app = make_signaling_app(hub, cfg.stun_urls)
 
     runners = []
-    for app, port, label in [
-        (page_app, cfg.port, "page+pose"),
-        (sig_app, cfg.signal_port, "signaling"),
-    ]:
+    apps = [(page_app, cfg.port, "page+pose")]
+    if cfg.pose_only:
+        log.info("pose-only mode: WebRTC signaling/video disabled")
+    else:
+        hub = MediaHub()
+        sig_app = make_signaling_app(hub, cfg.stun_urls)
+        apps.append((sig_app, cfg.signal_port, "signaling"))
+
+    for app, port, label in apps:
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, cfg.host, port, ssl_context=ssl_ctx)
@@ -721,18 +772,25 @@ async def _run(cfg: Config) -> None:
     log.info("  Quest 3 에서 접속할 URL  (LAN — Wi-Fi 같은 공유기)")
     if lan_ips:
         for ip in lan_ips:
-            log.info("    1) https://%s:%d/   ← cert 예외 1회 수락 (signaling 포트)",
-                     ip, cfg.signal_port)
-            log.info("    2) https://%s:%d/?robot=0   ← 메인 페이지", ip, cfg.port)
+            if cfg.pose_only:
+                log.info("    →  https://%s:%d/?robot=0   ← 메인 페이지", ip, cfg.port)
+            else:
+                log.info("    1) https://%s:%d/   ← cert 예외 1회 수락 (signaling 포트)",
+                         ip, cfg.signal_port)
+                log.info("    2) https://%s:%d/?robot=0   ← 메인 페이지", ip, cfg.port)
     else:
         log.info("    →  (LAN IP 미감지 — Wi-Fi/이더넷 연결 확인 필요)")
     log.info("")
-    log.info("  Home Server 가 접속할 URL  (Tailscale)")
-    if ts_ips:
-        for ip in ts_ips:
-            log.info("    →  wss://%s:%d/signaling/server", ip, cfg.signal_port)
+    if cfg.pose_only:
+        log.info("  Home Server WebRTC signaling")
+        log.info("    →  disabled (--pose-only)")
     else:
-        log.info("    →  (Tailscale IP 미감지 — 'sudo tailscale up')")
+        log.info("  Home Server 가 접속할 URL  (Tailscale)")
+        if ts_ips:
+            for ip in ts_ips:
+                log.info("    →  wss://%s:%d/signaling/server", ip, cfg.signal_port)
+        else:
+            log.info("    →  (Tailscale IP 미감지 — 'sudo tailscale up')")
     log.info("")
     log.info("  ZMQ pose PUB")
     log.info("    →  %s   topic=b'pose.<robot_id>'", cfg.zmq_addr)
@@ -768,6 +826,11 @@ def main() -> int:
                    help="static webroot (where index.html lives)")
     p.add_argument("--stun", action="append", default=[],
                    help="STUN URL(s), e.g. stun:stun.l.google.com:19302. LAN 내라 보통 불필요.")
+    p.add_argument(
+        "--pose-only",
+        action="store_true",
+        help="serve page+/ws and ZMQ pose only; skip aiortc/WebRTC video signaling",
+    )
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args()
 
@@ -792,6 +855,7 @@ def main() -> int:
         webroot=pathlib.Path(args.webroot).resolve(),
         cert_dir=pathlib.Path(args.webroot).resolve(),
         stun_urls=args.stun,
+        pose_only=args.pose_only,
     )
 
     cfg.detected_ifaces = check_interfaces()
